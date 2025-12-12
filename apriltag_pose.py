@@ -8,22 +8,17 @@ import numpy as np
 from picamera2 import Picamera2
 import json
 import os
-from math import degrees, atan2, sqrt, cos, sin
+from math import degrees, atan2, sqrt
 from camera_calibration import load_calibration, CALIBRATION_FILE
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from collections import deque
 
 # AprilTag parameters
 TARGET_TAG_ID = 0  # Tag ID to detect
 TAG_FAMILY = "tag36h11"  # AprilTag family
 TAG_SIZE = 0.06  # Tag size in meters (6cm default - adjust based on your tag)
 
-# Area coordinate system parameters
-AREA_SIZE = 200  # 2x2 meter area = 200x200 cm
-TAG_POSITION_AREA = (100, 200)  # Tag position in area coordinates (cm) - middle of north wall
-TAG_ORIENTATION_AREA = -90  # Tag orientation in degrees (facing south = -90 degrees)
-MAX_TRAIL_LENGTH = 100  # Maximum number of positions to keep in trail
+# Parking area coordinate system parameters
+AREA_SIZE = 200  # 200x200 cm parking area
+TAG_POSITION_AREA = (100, 200)  # Tag position in area coordinates (cm) - middle of upper wall
 
 # AprilTag 3D object points (in tag coordinate system)
 # Tag center is at origin, tag lies in XY plane, Z points outward
@@ -247,143 +242,6 @@ def format_pose_info(tvec, rvec):
     }
 
 
-def transform_to_area_coordinates(tvec, rvec):
-    """
-    Transform camera position from tag coordinate system to area coordinate system.
-    
-    Args:
-        tvec: Translation vector (camera position relative to tag) in meters
-        rvec: Rotation vector (camera rotation relative to tag)
-    
-    Returns:
-        (x_area, y_area, theta_area): Camera position in area coordinates (cm, cm, degrees)
-    """
-    # Convert tvec from meters to cm
-    x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
-    
-    # Tag is on north wall facing south
-    # Tag coordinate system: X (right/east), Y (up), Z (out/south toward camera)
-    # Area coordinate system: X (east), Y (north/up), origin at bottom-left
-    # 
-    # When tag faces south (into the area):
-    # - Tag X (right) -> Area X (east) 
-    # - Tag Z (out/south) -> Area -Y (south = negative Y, since Y increases north)
-    # - Tag Y (up) -> ignored (vertical, not in 2D plane)
-    
-    # Get tag orientation in area (tag facing south = -90 degrees)
-    tag_theta_rad = np.radians(TAG_ORIENTATION_AREA)
-    
-    # Transform tag-relative position to area-relative position
-    # Tag's local coordinate system needs to be rotated to align with area
-    # If tag faces south (-90 deg), we rotate tag coords by +90 deg to get area coords
-    x_rel_tag = x_tag  # Tag X (right/east)
-    y_rel_tag = -z_tag  # Tag Z (out/south) -> negative Y in area (south)
-    
-    # Rotate by tag orientation to align with area coordinate system
-    # Tag orientation is -90 degrees (facing south), so rotate by +90 to get area coords
-    x_area_rel = x_rel_tag * cos(tag_theta_rad) - y_rel_tag * sin(tag_theta_rad)
-    y_area_rel = x_rel_tag * sin(tag_theta_rad) + y_rel_tag * cos(tag_theta_rad)
-    
-    # Translate to area coordinates (add tag position)
-    x_area = TAG_POSITION_AREA[0] + x_area_rel
-    y_area = TAG_POSITION_AREA[1] + y_area_rel
-    
-    # Calculate camera orientation in area coordinates
-    # Get camera rotation relative to tag
-    R_tag, _ = cv2.Rodrigues(rvec)
-    # Extract yaw from rotation matrix (rotation around Z axis)
-    yaw_tag = atan2(R_tag[1, 0], R_tag[0, 0])
-    # Transform to area coordinates by adding tag orientation
-    theta_area = degrees(yaw_tag + tag_theta_rad)
-    
-    return x_area, y_area, theta_area
-
-
-def setup_area_plot():
-    """
-    Setup matplotlib figure for area coordinate visualization.
-    
-    Returns:
-        fig, ax: Figure and axes objects
-    """
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_xlim(0, AREA_SIZE)
-    ax.set_ylim(0, AREA_SIZE)
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlabel('X (cm) - East', fontsize=12)
-    ax.set_ylabel('Y (cm) - North', fontsize=12)
-    ax.set_title('Robot Position in Area Coordinate System', fontsize=14, fontweight='bold')
-    
-    # Draw area boundary
-    area_rect = patches.Rectangle((0, 0), AREA_SIZE, AREA_SIZE, 
-                                  linewidth=2, edgecolor='black', facecolor='lightgray', alpha=0.2)
-    ax.add_patch(area_rect)
-    
-    # Draw tag position
-    ax.plot(TAG_POSITION_AREA[0], TAG_POSITION_AREA[1], 'rs', markersize=15, 
-            label='AprilTag', markeredgecolor='darkred', markeredgewidth=2)
-    
-    # Draw tag orientation arrow
-    tag_arrow_length = 15
-    tag_theta_rad = np.radians(TAG_ORIENTATION_AREA)
-    ax.arrow(TAG_POSITION_AREA[0], TAG_POSITION_AREA[1],
-             tag_arrow_length * cos(tag_theta_rad),
-             tag_arrow_length * sin(tag_theta_rad),
-             head_width=5, head_length=5, fc='red', ec='red', linewidth=2)
-    
-    ax.legend(loc='upper right')
-    plt.tight_layout()
-    plt.ion()  # Turn on interactive mode
-    plt.show(block=False)
-    
-    return fig, ax
-
-
-def update_area_plot(ax, x_area, y_area, theta_area, position_history):
-    """
-    Update the area plot with current camera position.
-    
-    Args:
-        ax: Matplotlib axes object
-        x_area: X position in area coordinates (cm)
-        y_area: Y position in area coordinates (cm)
-        theta_area: Orientation in area coordinates (degrees)
-        position_history: Deque of previous positions for trail
-    """
-    # Clear previous camera position (keep everything else)
-    # Remove camera-related artists
-    for artist in ax.lines + ax.patches:
-        if hasattr(artist, 'get_label') and artist.get_label() in ['Camera', 'Trail', 'Camera Arrow']:
-            artist.remove()
-    
-    # Draw trail
-    if len(position_history) > 1:
-        trail_x = [p[0] for p in position_history]
-        trail_y = [p[1] for p in position_history]
-        ax.plot(trail_x, trail_y, 'b-', linewidth=2, alpha=0.5, label='Trail')
-    
-    # Draw current camera position
-    ax.plot(x_area, y_area, 'bo', markersize=12, label='Camera', 
-            markeredgecolor='darkblue', markeredgewidth=2)
-    
-    # Draw orientation arrow
-    arrow_length = 10
-    theta_rad = np.radians(theta_area)
-    ax.arrow(x_area, y_area,
-             arrow_length * cos(theta_rad),
-             arrow_length * sin(theta_rad),
-             head_width=4, head_length=4, fc='blue', ec='blue', linewidth=2, label='Camera Arrow')
-    
-    # Add text label with coordinates
-    ax.text(x_area + 5, y_area + 5, 
-            f'({x_area:.1f}, {y_area:.1f})\nθ: {theta_area:.1f}°',
-            fontsize=9, bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
-    
-    plt.draw()
-    plt.pause(0.01)  # Small pause to allow GUI update
-
-
 def draw_pose_info(img, pose_data, start_x=10, start_y=30):
     """
     Draw pose information on image with readable formatting.
@@ -462,6 +320,146 @@ def draw_pose_info(img, pose_data, start_x=10, start_y=30):
     )
 
 
+def transform_to_area_coordinates(tvec, rvec):
+    """
+    Transform camera position from tag coordinate system to parking area coordinate system.
+    
+    Tag coordinate system: X (right), Y (up), Z (out toward camera)
+    Area coordinate system: X (east/right), Y (north/up), origin at bottom-left (0,0)
+    Tag is at (100, 200) on upper wall, facing south (into the area)
+    
+    Args:
+        tvec: Translation vector (camera position relative to tag) in meters
+        rvec: Rotation vector (camera rotation relative to tag)
+    
+    Returns:
+        (x_area, y_area, yaw_area): Car position in area coordinates (cm, cm, degrees)
+    """
+    # Convert tvec from meters to cm
+    x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
+    
+    # Tag is on upper wall facing south
+    # Tag coordinate system: X (right/east), Y (up), Z (out/south toward camera)
+    # Area coordinate system: X (east), Y (north/up), origin at bottom-left
+    # 
+    # Transformation:
+    # - Tag X (right/east) -> Area X (east) - same direction
+    # - Tag Z (out/south) -> Area Y (but negative since tag is at Y=200, moving south decreases Y)
+    # - Tag Y (up) -> ignored (vertical, not in 2D plane)
+    
+    # Transform tag-relative position to area coordinates
+    # Tag X maps directly to Area X
+    x_area_rel = x_tag
+    # Tag Z (out/south) maps to negative Area Y (since tag is at top)
+    y_area_rel = -z_tag
+    
+    # Translate to area coordinates (add tag position)
+    x_area = TAG_POSITION_AREA[0] + x_area_rel
+    y_area = TAG_POSITION_AREA[1] + y_area_rel
+    
+    # Calculate car orientation (yaw) in area coordinates
+    # Get camera rotation relative to tag
+    R_tag, _ = cv2.Rodrigues(rvec)
+    # Extract yaw from rotation matrix (rotation around Z axis)
+    yaw_tag_rad = atan2(R_tag[1, 0], R_tag[0, 0])
+    # Tag faces south (-90 degrees), so add 180 degrees to get area orientation
+    # (camera facing same direction as tag means facing south = -90 in area)
+    yaw_area = degrees(yaw_tag_rad + np.pi)  # Add 180 degrees
+    
+    return x_area, y_area, yaw_area
+
+
+def create_area_visualization(x_area, y_area, yaw_area):
+    """
+    Create a visualization of the parking area with car position.
+    
+    Args:
+        x_area: Car X position in area coordinates (cm)
+        y_area: Car Y position in area coordinates (cm)
+        yaw_area: Car yaw angle in area coordinates (degrees)
+    
+    Returns:
+        Visualization image
+    """
+    # Create image (scale: 2 pixels per cm, so 400x400 pixels for 200x200 cm)
+    scale = 2  # Scale factor for better visibility
+    img_size = AREA_SIZE * scale
+    img = np.ones((img_size, img_size, 3), dtype=np.uint8) * 240  # Light gray background
+    
+    # Draw grid
+    grid_spacing = 50  # 50 cm grid
+    for i in range(0, AREA_SIZE + 1, grid_spacing):
+        x_pixel = i * scale
+        cv2.line(img, (x_pixel, 0), (x_pixel, img_size), (200, 200, 200), 1)
+        cv2.line(img, (0, x_pixel), (img_size, x_pixel), (200, 200, 200), 1)
+    
+    # Draw area boundary
+    cv2.rectangle(img, (0, 0), (img_size - 1, img_size - 1), (0, 0, 0), 2)
+    
+    # Draw tag position
+    tag_x_pixel = TAG_POSITION_AREA[0] * scale
+    tag_y_pixel = (AREA_SIZE - TAG_POSITION_AREA[1]) * scale  # Flip Y axis (image Y increases downward)
+    cv2.circle(img, (tag_x_pixel, tag_y_pixel), 8, (0, 0, 255), -1)  # Red circle
+    cv2.circle(img, (tag_x_pixel, tag_y_pixel), 8, (0, 0, 0), 2)  # Black border
+    cv2.putText(img, "TAG", (tag_x_pixel - 15, tag_y_pixel - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    
+    # Draw tag orientation arrow (facing south)
+    arrow_length = 15 * scale
+    tag_arrow_end_x = tag_x_pixel
+    tag_arrow_end_y = tag_y_pixel + arrow_length  # South is downward in image
+    cv2.arrowedLine(img, (tag_x_pixel, tag_y_pixel), 
+                   (tag_arrow_end_x, tag_arrow_end_y),
+                   (0, 0, 255), 3, tipLength=0.3)
+    
+    # Draw car position
+    car_x_pixel = x_area * scale
+    car_y_pixel = (AREA_SIZE - y_area) * scale  # Flip Y axis
+    
+    # Check if car is within area bounds
+    if 0 <= x_area <= AREA_SIZE and 0 <= y_area <= AREA_SIZE:
+        # Draw car as a circle
+        cv2.circle(img, (int(car_x_pixel), int(car_y_pixel)), 6, (0, 255, 0), -1)  # Green circle
+        cv2.circle(img, (int(car_x_pixel), int(car_y_pixel)), 6, (0, 0, 0), 2)  # Black border
+        
+        # Draw car orientation arrow
+        arrow_length = 12 * scale
+        yaw_rad = np.radians(yaw_area)
+        car_arrow_end_x = car_x_pixel + arrow_length * np.cos(yaw_rad)
+        car_arrow_end_y = car_y_pixel - arrow_length * np.sin(yaw_rad)  # Negative because Y is flipped
+        cv2.arrowedLine(img, (int(car_x_pixel), int(car_y_pixel)),
+                       (int(car_arrow_end_x), int(car_arrow_end_y)),
+                       (0, 255, 0), 3, tipLength=0.3)
+        
+        # Draw coordinates text near car
+        coord_text = f"({x_area:.1f}, {y_area:.1f})"
+        yaw_text = f"{yaw_area:.1f}°"
+        cv2.putText(img, coord_text, (int(car_x_pixel) + 10, int(car_y_pixel) - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+        cv2.putText(img, yaw_text, (int(car_x_pixel) + 10, int(car_y_pixel) + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+    else:
+        # Car is outside area - draw with different color
+        cv2.circle(img, (int(car_x_pixel), int(car_y_pixel)), 6, (0, 165, 255), -1)  # Orange
+        cv2.circle(img, (int(car_x_pixel), int(car_y_pixel)), 6, (0, 0, 0), 2)
+    
+    # Add title and labels
+    cv2.putText(img, "PARKING AREA (200x200 cm)", (10, 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+    cv2.putText(img, f"Car Position: ({x_area:.1f}, {y_area:.1f}) cm", (10, img_size - 50),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    cv2.putText(img, f"Car Yaw: {yaw_area:.1f} deg", (10, img_size - 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    
+    # Add axis labels
+    cv2.putText(img, "X (East)", (img_size - 80, img_size - 10),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    cv2.putText(img, "Y (North)", (10, 20),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    
+    return img
+
+
 def main():
     """
     Main function to detect AprilTag and compute camera pose.
@@ -502,11 +500,6 @@ def main():
             print("  1. pyapriltags (recommended): pip install pyapriltags")
             print("  2. Or ensure OpenCV >= 4.7.0 with contrib modules")
             return
-    
-    # Initialize area coordinate visualization
-    print("\nSetting up area coordinate visualization...")
-    fig, ax = setup_area_plot()
-    position_history = deque(maxlen=MAX_TRAIL_LENGTH)
     
     # Initialize camera
     print("Initializing camera...")
@@ -573,10 +566,12 @@ def main():
                             # Display pose info on image with readable formatting
                             draw_pose_info(display_frame, pose_data)
                             
-                            # Transform to area coordinates and update plot
-                            x_area, y_area, theta_area = transform_to_area_coordinates(tvec, rvec)
-                            position_history.append((x_area, y_area, theta_area))
-                            update_area_plot(ax, x_area, y_area, theta_area, position_history)
+                            # Transform to area coordinates
+                            x_area, y_area, yaw_area = transform_to_area_coordinates(tvec, rvec)
+                            
+                            # Create and display area visualization
+                            area_img = create_area_visualization(x_area, y_area, yaw_area)
+                            cv2.imshow("Parking Area - Car Position", area_img)
             else:  # opencv
                 # OpenCV returns (corners, ids, rejected)
                 corners, ids, rejected = tags_result
@@ -615,10 +610,12 @@ def main():
                                 # Display pose info on image with readable formatting
                                 draw_pose_info(display_frame, pose_data)
                                 
-                                # Transform to area coordinates and update plot
-                                x_area, y_area, theta_area = transform_to_area_coordinates(tvec, rvec)
-                                position_history.append((x_area, y_area, theta_area))
-                                update_area_plot(ax, x_area, y_area, theta_area, position_history)
+                                # Transform to area coordinates
+                                x_area, y_area, yaw_area = transform_to_area_coordinates(tvec, rvec)
+                                
+                                # Create and display area visualization
+                                area_img = create_area_visualization(x_area, y_area, yaw_area)
+                                cv2.imshow("Parking Area - Car Position", area_img)
             
             # Display status
             if not tag_found:
@@ -626,6 +623,28 @@ def main():
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cv2.putText(display_frame, f"Looking for tag ID {TARGET_TAG_ID}", (10, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Show empty area visualization when tag not found
+                area_img_empty = np.ones((AREA_SIZE * 2, AREA_SIZE * 2, 3), dtype=np.uint8) * 240
+                # Draw grid
+                grid_spacing = 50
+                for i in range(0, AREA_SIZE + 1, grid_spacing):
+                    x_pixel = i * 2
+                    cv2.line(area_img_empty, (x_pixel, 0), (x_pixel, AREA_SIZE * 2), (200, 200, 200), 1)
+                    cv2.line(area_img_empty, (0, x_pixel), (AREA_SIZE * 2, x_pixel), (200, 200, 200), 1)
+                cv2.rectangle(area_img_empty, (0, 0), (AREA_SIZE * 2 - 1, AREA_SIZE * 2 - 1), (0, 0, 0), 2)
+                # Draw tag
+                tag_x_pixel = TAG_POSITION_AREA[0] * 2
+                tag_y_pixel = (AREA_SIZE - TAG_POSITION_AREA[1]) * 2
+                cv2.circle(area_img_empty, (tag_x_pixel, tag_y_pixel), 8, (0, 0, 255), -1)
+                cv2.circle(area_img_empty, (tag_x_pixel, tag_y_pixel), 8, (0, 0, 0), 2)
+                cv2.putText(area_img_empty, "TAG", (tag_x_pixel - 15, tag_y_pixel - 15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                cv2.putText(area_img_empty, "PARKING AREA (200x200 cm)", (10, 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                cv2.putText(area_img_empty, "Waiting for tag detection...", (10, AREA_SIZE * 2 - 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.imshow("Parking Area - Car Position", area_img_empty)
             
             # Resize for display if too large
             if display_frame.shape[1] > 1280:
@@ -674,7 +693,12 @@ def main():
     finally:
         picam2.stop()
         cv2.destroyAllWindows()
-        plt.close('all')  # Close matplotlib figures
+        # Close both windows
+        try:
+            cv2.destroyWindow("AprilTag Pose Estimation - Press 'q' to quit")
+            cv2.destroyWindow("Parking Area - Car Position")
+        except:
+            pass
 
 
 if __name__ == "__main__":
