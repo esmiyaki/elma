@@ -325,8 +325,8 @@ def transform_to_area_coordinates(tvec, rvec):
     Transform camera position from tag coordinate system to parking area coordinate system.
     
     Transformation rules:
-    - new_x = 100 - old_x (where old_x is tag X coordinate in cm)
-    - new_y = 200 - old_z (where old_z is tag Z coordinate in cm)
+    - new_x = 100 - old_z (where old_z is tag Z coordinate in cm)
+    - new_y = 200 - old_x (where old_x is tag X coordinate in cm)
     - new_orientation = 90 + old_pitch_angle (in degrees)
     - Origin at bottom-left, 0 degrees = facing east (right wall)
     
@@ -340,9 +340,9 @@ def transform_to_area_coordinates(tvec, rvec):
     # Convert tvec from meters to cm
     x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
     
-    # Apply transformation: new_x = 100 - old_x, new_y = 200 - old_z
-    x_area = 100 - x_tag
-    y_area = 200 - z_tag
+    # Apply transformation: new_x = 100 - old_z, new_y = 200 - old_x
+    x_area = 100 - z_tag
+    y_area = 200 - x_tag
     
     # Calculate pitch angle from rotation vector
     R_tag, _ = cv2.Rodrigues(rvec)
