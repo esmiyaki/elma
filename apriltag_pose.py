@@ -324,9 +324,11 @@ def transform_to_area_coordinates(tvec, rvec):
     """
     Transform camera position from tag coordinate system to parking area coordinate system.
     
-    Tag coordinate system: X (right), Y (up), Z (out toward camera)
-    Area coordinate system: X (east/right), Y (north/up), origin at bottom-left (0,0)
-    Tag is at (100, 200) on upper wall, facing south (into the area)
+    Transformation rules:
+    - new_x = 100 - old_x (where old_x is tag X coordinate in cm)
+    - new_y = 200 - old_z (where old_z is tag Z coordinate in cm)
+    - new_orientation = 90 + old_pitch_angle (in degrees)
+    - Origin at bottom-left, 0 degrees = facing east (right wall)
     
     Args:
         tvec: Translation vector (camera position relative to tag) in meters
@@ -338,33 +340,20 @@ def transform_to_area_coordinates(tvec, rvec):
     # Convert tvec from meters to cm
     x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
     
-    # Tag is on upper wall facing south
-    # Tag coordinate system: X (right/east), Y (up), Z (out/south toward camera)
-    # Area coordinate system: X (east), Y (north/up), origin at bottom-left
-    # 
-    # Transformation:
-    # - Tag X (right/east) -> Area X (east) - same direction
-    # - Tag Z (out/south) -> Area Y (but negative since tag is at Y=200, moving south decreases Y)
-    # - Tag Y (up) -> ignored (vertical, not in 2D plane)
+    # Apply transformation: new_x = 100 - old_x, new_y = 200 - old_z
+    x_area = 100 - x_tag
+    y_area = 200 - z_tag
     
-    # Transform tag-relative position to area coordinates
-    # Tag X maps directly to Area X
-    x_area_rel = x_tag
-    # Tag Z (out/south) maps to negative Area Y (since tag is at top)
-    y_area_rel = -z_tag
-    
-    # Translate to area coordinates (add tag position)
-    x_area = TAG_POSITION_AREA[0] + x_area_rel
-    y_area = TAG_POSITION_AREA[1] + y_area_rel
-    
-    # Calculate car orientation (yaw) in area coordinates
-    # Get camera rotation relative to tag
+    # Calculate pitch angle from rotation vector
     R_tag, _ = cv2.Rodrigues(rvec)
-    # Extract yaw from rotation matrix (rotation around Z axis)
-    yaw_tag_rad = atan2(R_tag[1, 0], R_tag[0, 0])
-    # Tag faces south (-90 degrees), so add 180 degrees to get area orientation
-    # (camera facing same direction as tag means facing south = -90 in area)
-    yaw_area = degrees(yaw_tag_rad + np.pi)  # Add 180 degrees
+    # Extract pitch angle (rotation around Y axis)
+    # Pitch is the angle between the camera's forward direction and the horizontal plane
+    # We can get it from the rotation matrix
+    pitch_rad = -atan2(R_tag[2, 0], sqrt(R_tag[2, 1]**2 + R_tag[2, 2]**2))
+    pitch_deg = degrees(pitch_rad)
+    
+    # Apply transformation: new_orientation = 90 + old_pitch_angle
+    yaw_area = 90 + pitch_deg
     
     return x_area, y_area, yaw_area
 
