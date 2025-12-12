@@ -8,13 +8,22 @@ import numpy as np
 from picamera2 import Picamera2
 import json
 import os
-from math import degrees, atan2, sqrt
+from math import degrees, atan2, sqrt, cos, sin
 from camera_calibration import load_calibration, CALIBRATION_FILE
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from collections import deque
 
 # AprilTag parameters
 TARGET_TAG_ID = 0  # Tag ID to detect
 TAG_FAMILY = "tag36h11"  # AprilTag family
 TAG_SIZE = 0.06  # Tag size in meters (6cm default - adjust based on your tag)
+
+# Area coordinate system parameters
+AREA_SIZE = 200  # 2x2 meter area = 200x200 cm
+TAG_POSITION_AREA = (100, 200)  # Tag position in area coordinates (cm) - middle of north wall
+TAG_ORIENTATION_AREA = -90  # Tag orientation in degrees (facing south = -90 degrees)
+MAX_TRAIL_LENGTH = 100  # Maximum number of positions to keep in trail
 
 # AprilTag 3D object points (in tag coordinate system)
 # Tag center is at origin, tag lies in XY plane, Z points outward
@@ -39,19 +48,25 @@ def get_tag_object_points(tag_size):
     return obj_points
 
 
-def detect_apriltag(image, detector):
+def detect_apriltag(image, detector, detector_type='pyapriltags'):
     """
     Detect AprilTag in image.
     
     Args:
         image: Input image (grayscale)
         detector: AprilTag detector object
+        detector_type: Type of detector ('pyapriltags' or 'opencv')
     
     Returns:
-        List of detected tags
+        For pyapriltags: List of detected tags
+        For opencv: (corners, ids, rejected)
     """
-    tags = detector.detect(image)
-    return tags
+    if detector_type == 'pyapriltags':
+        tags = detector.detect(image)
+        return tags
+    else:  # opencv
+        corners, ids, rejected = detector.detect(image)
+        return corners, ids, rejected
 
 
 def draw_tag_axes(image, camera_matrix, dist_coeffs, rvec, tvec, tag_size):
@@ -165,16 +180,54 @@ def compute_camera_pose(tag_corners, camera_matrix, dist_coeffs, tag_size):
     return success, rvec, tvec
 
 
+def draw_text_with_background(img, text, position, font_scale=0.7, thickness=2, 
+                              text_color=(255, 255, 255), bg_color=(0, 0, 0), alpha=0.7):
+    """
+    Draw text with a semi-transparent background for better readability.
+    
+    Args:
+        img: Image to draw on
+        text: Text to draw
+        position: (x, y) position of text
+        font_scale: Font scale
+        thickness: Text thickness
+        text_color: Text color (BGR)
+        bg_color: Background color (BGR)
+        alpha: Background transparency (0.0 to 1.0)
+    
+    Returns:
+        Height of the drawn text block
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    
+    # Calculate background rectangle
+    x, y = position
+    padding = 5
+    bg_top_left = (x - padding, y - text_height - padding)
+    bg_bottom_right = (x + text_width + padding, y + baseline + padding)
+    
+    # Draw semi-transparent background
+    overlay = img.copy()
+    cv2.rectangle(overlay, bg_top_left, bg_bottom_right, bg_color, -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    
+    # Draw text on top
+    cv2.putText(img, text, position, font, font_scale, text_color, thickness)
+    
+    return text_height + baseline + padding * 2
+
+
 def format_pose_info(tvec, rvec):
     """
-    Format pose information as readable string.
+    Format pose information as readable dictionary.
     
     Args:
         tvec: Translation vector (camera position relative to tag)
         rvec: Rotation vector (camera rotation relative to tag)
     
     Returns:
-        Formatted string with pose information
+        Dictionary with formatted pose information
     """
     # Position (camera relative to tag)
     x, y, z = tvec.flatten()
@@ -183,17 +236,230 @@ def format_pose_info(tvec, rvec):
     # Orientation (Euler angles)
     roll, pitch, yaw = rotation_vector_to_euler(rvec)
     
-    info = f"Camera Position (relative to tag):\n"
-    info += f"  X: {x*100:.2f} cm\n"
-    info += f"  Y: {y*100:.2f} cm\n"
-    info += f"  Z: {z*100:.2f} cm\n"
-    info += f"  Distance: {distance*100:.2f} cm\n"
-    info += f"\nCamera Orientation (Euler angles):\n"
-    info += f"  Roll:  {roll:.2f}°\n"
-    info += f"  Pitch: {pitch:.2f}°\n"
-    info += f"  Yaw:   {yaw:.2f}°\n"
+    return {
+        'x': x * 100,  # cm
+        'y': y * 100,  # cm
+        'z': z * 100,  # cm
+        'distance': distance * 100,  # cm
+        'roll': roll,
+        'pitch': pitch,
+        'yaw': yaw
+    }
+
+
+def transform_to_area_coordinates(tvec, rvec):
+    """
+    Transform camera position from tag coordinate system to area coordinate system.
     
-    return info
+    Args:
+        tvec: Translation vector (camera position relative to tag) in meters
+        rvec: Rotation vector (camera rotation relative to tag)
+    
+    Returns:
+        (x_area, y_area, theta_area): Camera position in area coordinates (cm, cm, degrees)
+    """
+    # Convert tvec from meters to cm
+    x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
+    
+    # Tag is on north wall facing south
+    # Tag coordinate system: X (right/east), Y (up), Z (out/south toward camera)
+    # Area coordinate system: X (east), Y (north/up), origin at bottom-left
+    # 
+    # When tag faces south (into the area):
+    # - Tag X (right) -> Area X (east) 
+    # - Tag Z (out/south) -> Area -Y (south = negative Y, since Y increases north)
+    # - Tag Y (up) -> ignored (vertical, not in 2D plane)
+    
+    # Get tag orientation in area (tag facing south = -90 degrees)
+    tag_theta_rad = np.radians(TAG_ORIENTATION_AREA)
+    
+    # Transform tag-relative position to area-relative position
+    # Tag's local coordinate system needs to be rotated to align with area
+    # If tag faces south (-90 deg), we rotate tag coords by +90 deg to get area coords
+    x_rel_tag = x_tag  # Tag X (right/east)
+    y_rel_tag = -z_tag  # Tag Z (out/south) -> negative Y in area (south)
+    
+    # Rotate by tag orientation to align with area coordinate system
+    # Tag orientation is -90 degrees (facing south), so rotate by +90 to get area coords
+    x_area_rel = x_rel_tag * cos(tag_theta_rad) - y_rel_tag * sin(tag_theta_rad)
+    y_area_rel = x_rel_tag * sin(tag_theta_rad) + y_rel_tag * cos(tag_theta_rad)
+    
+    # Translate to area coordinates (add tag position)
+    x_area = TAG_POSITION_AREA[0] + x_area_rel
+    y_area = TAG_POSITION_AREA[1] + y_area_rel
+    
+    # Calculate camera orientation in area coordinates
+    # Get camera rotation relative to tag
+    R_tag, _ = cv2.Rodrigues(rvec)
+    # Extract yaw from rotation matrix (rotation around Z axis)
+    yaw_tag = atan2(R_tag[1, 0], R_tag[0, 0])
+    # Transform to area coordinates by adding tag orientation
+    theta_area = degrees(yaw_tag + tag_theta_rad)
+    
+    return x_area, y_area, theta_area
+
+
+def setup_area_plot():
+    """
+    Setup matplotlib figure for area coordinate visualization.
+    
+    Returns:
+        fig, ax: Figure and axes objects
+    """
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_xlim(0, AREA_SIZE)
+    ax.set_ylim(0, AREA_SIZE)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X (cm) - East', fontsize=12)
+    ax.set_ylabel('Y (cm) - North', fontsize=12)
+    ax.set_title('Robot Position in Area Coordinate System', fontsize=14, fontweight='bold')
+    
+    # Draw area boundary
+    area_rect = patches.Rectangle((0, 0), AREA_SIZE, AREA_SIZE, 
+                                  linewidth=2, edgecolor='black', facecolor='lightgray', alpha=0.2)
+    ax.add_patch(area_rect)
+    
+    # Draw tag position
+    ax.plot(TAG_POSITION_AREA[0], TAG_POSITION_AREA[1], 'rs', markersize=15, 
+            label='AprilTag', markeredgecolor='darkred', markeredgewidth=2)
+    
+    # Draw tag orientation arrow
+    tag_arrow_length = 15
+    tag_theta_rad = np.radians(TAG_ORIENTATION_AREA)
+    ax.arrow(TAG_POSITION_AREA[0], TAG_POSITION_AREA[1],
+             tag_arrow_length * cos(tag_theta_rad),
+             tag_arrow_length * sin(tag_theta_rad),
+             head_width=5, head_length=5, fc='red', ec='red', linewidth=2)
+    
+    ax.legend(loc='upper right')
+    plt.tight_layout()
+    plt.ion()  # Turn on interactive mode
+    plt.show(block=False)
+    
+    return fig, ax
+
+
+def update_area_plot(ax, x_area, y_area, theta_area, position_history):
+    """
+    Update the area plot with current camera position.
+    
+    Args:
+        ax: Matplotlib axes object
+        x_area: X position in area coordinates (cm)
+        y_area: Y position in area coordinates (cm)
+        theta_area: Orientation in area coordinates (degrees)
+        position_history: Deque of previous positions for trail
+    """
+    # Clear previous camera position (keep everything else)
+    # Remove camera-related artists
+    for artist in ax.lines + ax.patches:
+        if hasattr(artist, 'get_label') and artist.get_label() in ['Camera', 'Trail', 'Camera Arrow']:
+            artist.remove()
+    
+    # Draw trail
+    if len(position_history) > 1:
+        trail_x = [p[0] for p in position_history]
+        trail_y = [p[1] for p in position_history]
+        ax.plot(trail_x, trail_y, 'b-', linewidth=2, alpha=0.5, label='Trail')
+    
+    # Draw current camera position
+    ax.plot(x_area, y_area, 'bo', markersize=12, label='Camera', 
+            markeredgecolor='darkblue', markeredgewidth=2)
+    
+    # Draw orientation arrow
+    arrow_length = 10
+    theta_rad = np.radians(theta_area)
+    ax.arrow(x_area, y_area,
+             arrow_length * cos(theta_rad),
+             arrow_length * sin(theta_rad),
+             head_width=4, head_length=4, fc='blue', ec='blue', linewidth=2, label='Camera Arrow')
+    
+    # Add text label with coordinates
+    ax.text(x_area + 5, y_area + 5, 
+            f'({x_area:.1f}, {y_area:.1f})\nθ: {theta_area:.1f}°',
+            fontsize=9, bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+    
+    plt.draw()
+    plt.pause(0.01)  # Small pause to allow GUI update
+
+
+def draw_pose_info(img, pose_data, start_x=10, start_y=30):
+    """
+    Draw pose information on image with readable formatting.
+    
+    Args:
+        img: Image to draw on
+        pose_data: Dictionary with pose information from format_pose_info
+        start_x: Starting X position
+        start_y: Starting Y position
+    """
+    y_offset = start_y
+    font_scale = 0.8
+    thickness = 2
+    line_spacing = 35
+    
+    # Title
+    y_offset += draw_text_with_background(
+        img, "=== CAMERA POSE ===", (start_x, y_offset),
+        font_scale=1.0, thickness=2, text_color=(0, 255, 255), bg_color=(0, 0, 0), alpha=0.8
+    )
+    y_offset += line_spacing
+    
+    # Position section
+    y_offset += draw_text_with_background(
+        img, "POSITION (cm):", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(0, 255, 0), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing
+    
+    y_offset += draw_text_with_background(
+        img, f"  X: {pose_data['x']:>7.2f} cm", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(255, 255, 255), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing
+    
+    y_offset += draw_text_with_background(
+        img, f"  Y: {pose_data['y']:>7.2f} cm", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(255, 255, 255), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing
+    
+    y_offset += draw_text_with_background(
+        img, f"  Z: {pose_data['z']:>7.2f} cm", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(255, 255, 255), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing
+    
+    y_offset += draw_text_with_background(
+        img, f"  Distance: {pose_data['distance']:>6.2f} cm", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(0, 255, 255), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing * 2
+    
+    # Orientation section
+    y_offset += draw_text_with_background(
+        img, "ORIENTATION (deg):", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(0, 255, 0), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing
+    
+    y_offset += draw_text_with_background(
+        img, f"  Roll:  {pose_data['roll']:>6.2f}°", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(255, 255, 255), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing
+    
+    y_offset += draw_text_with_background(
+        img, f"  Pitch: {pose_data['pitch']:>6.2f}°", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(255, 255, 255), bg_color=(0, 0, 0), alpha=0.7
+    )
+    y_offset += line_spacing
+    
+    y_offset += draw_text_with_background(
+        img, f"  Yaw:   {pose_data['yaw']:>6.2f}°", (start_x, y_offset),
+        font_scale=font_scale, thickness=thickness, text_color=(255, 255, 255), bg_color=(0, 0, 0), alpha=0.7
+    )
 
 
 def main():
@@ -214,15 +480,33 @@ def main():
         print("Please run camera_calibration.py first.")
         return
     
-    # Initialize AprilTag detector
+    # Initialize AprilTag detector - try pyapriltags first (most reliable)
+    detector = None
+    detector_type = None
+    
+    # Try pyapriltags (recommended for Raspberry Pi)
     try:
-        import apriltag
-        detector = apriltag.Detector(families=TAG_FAMILY)
-        print(f"\nAprilTag detector initialized (family: {TAG_FAMILY})")
+        import pyapriltags
+        detector = pyapriltags.Detector(families=TAG_FAMILY)
+        detector_type = 'pyapriltags'
+        print(f"\npyapriltags detector initialized (family: {TAG_FAMILY})")
     except ImportError:
-        print("\nError: apriltag library not found!")
-        print("Install it with: pip install apriltag")
-        return
+        # Try OpenCV's AprilTag detector (if available)
+        try:
+            detector = cv2.aruco.AprilTagDetector()
+            detector_type = 'opencv'
+            print(f"\nOpenCV AprilTag detector initialized (family: {TAG_FAMILY})")
+        except AttributeError:
+            print("\nError: No AprilTag detector available!")
+            print("Please install one of the following:")
+            print("  1. pyapriltags (recommended): pip install pyapriltags")
+            print("  2. Or ensure OpenCV >= 4.7.0 with contrib modules")
+            return
+    
+    # Initialize area coordinate visualization
+    print("\nSetting up area coordinate visualization...")
+    fig, ax = setup_area_plot()
+    position_history = deque(maxlen=MAX_TRAIL_LENGTH)
     
     # Initialize camera
     print("Initializing camera...")
@@ -244,7 +528,7 @@ def main():
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             
             # Detect AprilTags
-            tags = detect_apriltag(gray, detector)
+            tags_result = detect_apriltag(gray, detector, detector_type)
             
             # Convert to BGR for OpenCV drawing
             display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -252,46 +536,89 @@ def main():
             tag_found = False
             pose_info = ""
             
-            # Look for target tag
-            for tag in tags:
-                if tag.tag_id == TARGET_TAG_ID:
-                    tag_found = True
-                    
-                    # Get tag corners (in image coordinates)
-                    # AprilTag returns corners in order: bottom-left, bottom-right, top-right, top-left
-                    tag_corners = tag.corners
-                    
-                    # Draw tag outline
-                    corners_int = tag.corners.astype(int)
-                    cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
-                    
-                    # Draw tag ID
-                    center = tag.center.astype(int)
-                    cv2.putText(display_frame, f"ID: {tag.tag_id}", 
-                               (center[0] - 30, center[1] - 20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    
-                    # Compute camera pose
-                    success, rvec, tvec = compute_camera_pose(
-                        tag_corners, camera_matrix, dist_coeffs, TAG_SIZE
-                    )
-                    
-                    if success:
-                        # Draw coordinate axes
-                        draw_tag_axes(display_frame, camera_matrix, dist_coeffs, 
-                                    rvec, tvec, TAG_SIZE)
+            # Process detected tags based on detector type
+            if detector_type == 'pyapriltags':
+                # pyapriltags returns a list of tag objects
+                for tag in tags_result:
+                    if tag.tag_id == TARGET_TAG_ID:
+                        tag_found = True
                         
-                        # Get pose information
-                        pose_info = format_pose_info(tvec, rvec)
+                        # Get tag corners (in image coordinates)
+                        # pyapriltags returns corners as array of 4 points
+                        tag_corners = tag.corners
                         
-                        # Display pose info on image
-                        lines = pose_info.split('\n')
-                        y_offset = 30
-                        for line in lines:
-                            if line.strip():
-                                cv2.putText(display_frame, line, (10, y_offset),
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                                y_offset += 20
+                        # Draw tag outline
+                        corners_int = tag_corners.astype(int)
+                        cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
+                        
+                        # Draw tag ID
+                        center = tag.center.astype(int)
+                        cv2.putText(display_frame, f"ID: {tag.tag_id}", 
+                                   (center[0] - 30, center[1] - 20),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        # Compute camera pose
+                        success, rvec, tvec = compute_camera_pose(
+                            tag_corners, camera_matrix, dist_coeffs, TAG_SIZE
+                        )
+                        
+                        if success:
+                            # Draw coordinate axes
+                            draw_tag_axes(display_frame, camera_matrix, dist_coeffs, 
+                                        rvec, tvec, TAG_SIZE)
+                            
+                            # Get pose information
+                            pose_data = format_pose_info(tvec, rvec)
+                            
+                            # Display pose info on image with readable formatting
+                            draw_pose_info(display_frame, pose_data)
+                            
+                            # Transform to area coordinates and update plot
+                            x_area, y_area, theta_area = transform_to_area_coordinates(tvec, rvec)
+                            position_history.append((x_area, y_area, theta_area))
+                            update_area_plot(ax, x_area, y_area, theta_area, position_history)
+            else:  # opencv
+                # OpenCV returns (corners, ids, rejected)
+                corners, ids, rejected = tags_result
+                if ids is not None and len(ids) > 0:
+                    for i, tag_id in enumerate(ids.flatten()):
+                        if tag_id == TARGET_TAG_ID:
+                            tag_found = True
+                            
+                            # Get tag corners (in image coordinates)
+                            # OpenCV returns corners as (1, 4, 2) array
+                            tag_corners = corners[i]
+                            
+                            # Draw tag outline
+                            corners_int = tag_corners.astype(int)
+                            cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
+                            
+                            # Calculate center for drawing ID
+                            center = tag_corners.mean(axis=0).astype(int)
+                            cv2.putText(display_frame, f"ID: {tag_id}", 
+                                       (center[0] - 30, center[1] - 20),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                            
+                            # Compute camera pose
+                            success, rvec, tvec = compute_camera_pose(
+                                tag_corners, camera_matrix, dist_coeffs, TAG_SIZE
+                            )
+                            
+                            if success:
+                                # Draw coordinate axes
+                                draw_tag_axes(display_frame, camera_matrix, dist_coeffs, 
+                                            rvec, tvec, TAG_SIZE)
+                                
+                                # Get pose information
+                                pose_data = format_pose_info(tvec, rvec)
+                                
+                                # Display pose info on image with readable formatting
+                                draw_pose_info(display_frame, pose_data)
+                                
+                                # Transform to area coordinates and update plot
+                                x_area, y_area, theta_area = transform_to_area_coordinates(tvec, rvec)
+                                position_history.append((x_area, y_area, theta_area))
+                                update_area_plot(ax, x_area, y_area, theta_area, position_history)
             
             # Display status
             if not tag_found:
@@ -311,8 +638,30 @@ def main():
             
             # Print pose info to console
             if tag_found and pose_info:
-                print("\r" + " "*80, end="")  # Clear line
-                print(f"\rTag detected! Distance: {sqrt(sum(tvec.flatten()**2))*100:.2f} cm", end="")
+                # Extract distance from pose_info or compute it
+                if detector_type == 'pyapriltags':
+                    for tag in tags_result:
+                        if tag.tag_id == TARGET_TAG_ID:
+                            success, rvec, tvec = compute_camera_pose(
+                                tag.corners, camera_matrix, dist_coeffs, TAG_SIZE
+                            )
+                            if success:
+                                distance = sqrt(sum(tvec.flatten()**2))
+                                print("\r" + " "*80, end="")  # Clear line
+                                print(f"\rTag detected! Distance: {distance*100:.2f} cm", end="")
+                                break
+                else:  # opencv
+                    if ids is not None:
+                        for i, tag_id in enumerate(ids.flatten()):
+                            if tag_id == TARGET_TAG_ID:
+                                success, rvec, tvec = compute_camera_pose(
+                                    corners[i], camera_matrix, dist_coeffs, TAG_SIZE
+                                )
+                                if success:
+                                    distance = sqrt(sum(tvec.flatten()**2))
+                                    print("\r" + " "*80, end="")  # Clear line
+                                    print(f"\rTag detected! Distance: {distance*100:.2f} cm", end="")
+                                    break
             
             # Exit on 'q' key
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -325,6 +674,7 @@ def main():
     finally:
         picam2.stop()
         cv2.destroyAllWindows()
+        plt.close('all')  # Close matplotlib figures
 
 
 if __name__ == "__main__":
