@@ -642,6 +642,22 @@ def main():
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cv2.putText(display_frame, f"Looking for tag ID {TARGET_TAG_ID}", (10, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Show empty map without car representation when tag not detected
+                map_img_empty = np.ones((MAP_SIZE * 2, MAP_SIZE * 2, 3), dtype=np.uint8) * 240
+                # Draw grid
+                grid_spacing = 50
+                for i in range(0, MAP_SIZE + 1, grid_spacing):
+                    x_pixel = i * 2
+                    cv2.line(map_img_empty, (x_pixel, 0), (x_pixel, MAP_SIZE * 2), (200, 200, 200), 1)
+                    cv2.line(map_img_empty, (0, x_pixel), (MAP_SIZE * 2, x_pixel), (200, 200, 200), 1)
+                cv2.rectangle(map_img_empty, (0, 0), (MAP_SIZE * 2 - 1, MAP_SIZE * 2 - 1), (0, 0, 0), 2)
+                # Add axis labels
+                cv2.putText(map_img_empty, "X (East)", (MAP_SIZE * 2 - 80, MAP_SIZE * 2 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                cv2.putText(map_img_empty, "Y (North)", (10, 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                cv2.imshow("Map - Car Position", map_img_empty)
             
             # Resize for display if too large
             if display_frame.shape[1] > 1280:
