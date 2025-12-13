@@ -197,12 +197,13 @@ def compute_camera_pose(tag_corners, camera_matrix, dist_coeffs, tag_size):
     tag_corners = np.array(tag_corners, dtype=np.float32).reshape(4, 1, 2)
     
     # Solve PnP to get pose
+    # Using SOLVEPNP_IPPE_SQUARE for better accuracy with square markers like AprilTags
     success, rvec, tvec = cv2.solvePnP(
         obj_points,
         tag_corners,
         camera_matrix,
         dist_coeffs,
-        flags=cv2.SOLVEPNP_ITERATIVE
+        flags=cv2.SOLVEPNP_IPPE_SQUARE
     )
     
     return success, rvec, tvec
@@ -356,7 +357,7 @@ def draw_pose_info(img, pose_data, start_x=10, start_y=30):
 
 def transform_to_map_coordinates(tvec, rvec):
     """
-    Transform camera position to map coordinate system.
+    Transform tag position to map coordinate system.
     
     Map coordinate system:
     - Origin at bottom-left (0, 0)
@@ -365,13 +366,13 @@ def transform_to_map_coordinates(tvec, rvec):
     - Angle increases clockwise
     
     Transformation:
-    - x_new = 100 + x_old (where x_old is camera X coordinate relative to tag in cm)
-    - y_new = 200 - z_old (where z_old is camera Z coordinate relative to tag in cm)
+    - x_new = 100 + x_old (where x_old is tag X coordinate in cm)
+    - y_new = 200 - z_old (where z_old is tag Z coordinate in cm)
     - orientation = -old_pitch_angle (in degrees)
     
     Args:
-        tvec: Translation vector (camera position relative to tag) in meters
-        rvec: Rotation vector (camera rotation relative to tag)
+        tvec: Translation vector (tag position relative to camera) in meters
+        rvec: Rotation vector (tag rotation relative to camera)
     
     Returns:
         (x_map, y_map, yaw_map): Car position in map coordinates (cm, cm, degrees)
@@ -573,18 +574,17 @@ def main():
                             draw_tag_axes(display_frame, camera_matrix, dist_coeffs, 
                                         rvec_cam, tvec_cam, TAG_SIZE)
                             
-                            # Use camera pose relative to tag directly (tag is already origin)
-                            # No inversion needed - solvePnP already gives camera relative to tag
-                            # where tag is at origin
+                            # Invert pose: get tag pose relative to camera
+                            tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
                             
-                            # Get pose information (camera relative to tag, tag as origin)
-                            pose_data = format_pose_info(tvec_cam, rvec_cam)
+                            # Get pose information (tag relative to camera)
+                            pose_data = format_pose_info(tag_tvec, tag_rvec)
                             
                             # Display pose info on image with readable formatting
                             draw_pose_info(display_frame, pose_data)
                             
-                            # Transform to map coordinates (using camera pose relative to tag)
-                            x_map, y_map, yaw_map = transform_to_map_coordinates(tvec_cam, rvec_cam)
+                            # Transform to map coordinates
+                            x_map, y_map, yaw_map = transform_to_map_coordinates(tag_tvec, tag_rvec)
                             
                             # Create and display map visualization
                             map_img = create_map_visualization(x_map, y_map, yaw_map)
@@ -621,18 +621,17 @@ def main():
                                 draw_tag_axes(display_frame, camera_matrix, dist_coeffs, 
                                             rvec_cam, tvec_cam, TAG_SIZE)
                                 
-                                # Use camera pose relative to tag directly (tag is already origin)
-                                # No inversion needed - solvePnP already gives camera relative to tag
-                                # where tag is at origin
+                                # Invert pose: get tag pose relative to camera
+                                tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
                                 
-                                # Get pose information (camera relative to tag, tag as origin)
-                                pose_data = format_pose_info(tvec_cam, rvec_cam)
+                                # Get pose information (tag relative to camera)
+                                pose_data = format_pose_info(tag_tvec, tag_rvec)
                                 
                                 # Display pose info on image with readable formatting
                                 draw_pose_info(display_frame, pose_data)
                                 
-                                # Transform to map coordinates (using camera pose relative to tag)
-                                x_map, y_map, yaw_map = transform_to_map_coordinates(tvec_cam, rvec_cam)
+                                # Transform to map coordinates
+                                x_map, y_map, yaw_map = transform_to_map_coordinates(tag_tvec, tag_rvec)
                                 
                                 # Create and display map visualization
                                 map_img = create_map_visualization(x_map, y_map, yaw_map)
@@ -679,8 +678,8 @@ def main():
                                 tag.corners, camera_matrix, dist_coeffs, TAG_SIZE
                             )
                             if success:
-                                # Use camera pose relative to tag directly (no inversion)
-                                distance = sqrt(sum(tvec_cam.flatten()**2))
+                                tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
+                                distance = sqrt(sum(tag_tvec.flatten()**2))
                                 print("\r" + " "*80, end="")  # Clear line
                                 print(f"\rTag detected! Distance: {distance*100:.2f} cm", end="")
                                 break
@@ -692,8 +691,8 @@ def main():
                                     corners[i], camera_matrix, dist_coeffs, TAG_SIZE
                                 )
                                 if success:
-                                    # Use camera pose relative to tag directly (no inversion)
-                                    distance = sqrt(sum(tvec_cam.flatten()**2))
+                                    tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
+                                    distance = sqrt(sum(tag_tvec.flatten()**2))
                                     print("\r" + " "*80, end="")  # Clear line
                                     print(f"\rTag detected! Distance: {distance*100:.2f} cm", end="")
                                     break
