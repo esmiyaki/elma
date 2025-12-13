@@ -43,6 +43,60 @@ def get_tag_object_points(tag_size):
     return obj_points
 
 
+def reorder_corners(corners):
+    """
+    Reorder AprilTag corners to match the expected order for solvePnP.
+    Expected order: bottom-left, bottom-right, top-right, top-left
+    
+    This function identifies corners based on their image positions:
+    - Bottom-left: minimum (x + y)
+    - Bottom-right: maximum (x - y) 
+    - Top-right: maximum (x + y)
+    - Top-left: minimum (x - y)
+    
+    Args:
+        corners: Array of 4 corner points (Nx2 or 4x1x2 format)
+    
+    Returns:
+        Reordered corners array in shape (4, 2)
+    """
+    corners = np.array(corners)
+    
+    # Reshape to (4, 2) if needed
+    if corners.shape == (4, 1, 2):
+        corners = corners.reshape(4, 2)
+    elif len(corners.shape) == 2 and corners.shape[0] == 4:
+        corners = corners.reshape(4, 2)
+    else:
+        return corners
+    
+    # Calculate sums and differences to identify corners
+    # In image coordinates: x increases right, y increases down
+    sums = corners[:, 0] + corners[:, 1]  # x + y
+    diffs = corners[:, 0] - corners[:, 1]  # x - y
+    
+    # Identify corners:
+    # Bottom-left: min sum (smallest x+y)
+    # Top-right: max sum (largest x+y)
+    # Bottom-right: max diff (largest x-y, so x >> y)
+    # Top-left: min diff (smallest x-y, so x << y)
+    
+    bottom_left_idx = np.argmin(sums)
+    top_right_idx = np.argmax(sums)
+    bottom_right_idx = np.argmax(diffs)
+    top_left_idx = np.argmin(diffs)
+    
+    # Reorder to: bottom-left, bottom-right, top-right, top-left
+    reordered = np.array([
+        corners[bottom_left_idx],
+        corners[bottom_right_idx],
+        corners[top_right_idx],
+        corners[top_left_idx]
+    ], dtype=np.float32)
+    
+    return reordered
+
+
 def detect_apriltag(image, detector, detector_type='pyapriltags'):
     """
     Detect AprilTag in image.
@@ -193,17 +247,19 @@ def compute_camera_pose(tag_corners, camera_matrix, dist_coeffs, tag_size):
     # Get 3D object points
     obj_points = get_tag_object_points(tag_size)
     
-    # Ensure corners are in correct format
+    # Reorder corners to match expected order (bottom-left, bottom-right, top-right, top-left)
+    tag_corners = reorder_corners(tag_corners)
+    
+    # Ensure corners are in correct format for solvePnP
     tag_corners = np.array(tag_corners, dtype=np.float32).reshape(4, 1, 2)
     
     # Solve PnP to get pose
-    # Using SOLVEPNP_IPPE_SQUARE for better accuracy with square markers like AprilTags
     success, rvec, tvec = cv2.solvePnP(
         obj_points,
         tag_corners,
         camera_matrix,
         dist_coeffs,
-        flags=cv2.SOLVEPNP_IPPE_SQUARE
+        flags=cv2.SOLVEPNP_ITERATIVE
     )
     
     return success, rvec, tvec
