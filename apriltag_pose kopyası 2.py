@@ -356,7 +356,7 @@ def draw_pose_info(img, pose_data, start_x=10, start_y=30):
 
 def transform_to_map_coordinates(tvec, rvec):
     """
-    Transform tag position to map coordinate system.
+    Transform camera position to map coordinate system.
     
     Map coordinate system:
     - Origin at bottom-left (0, 0)
@@ -365,13 +365,13 @@ def transform_to_map_coordinates(tvec, rvec):
     - Angle increases clockwise
     
     Transformation:
-    - x_new = 100 + x_old (where x_old is tag X coordinate in cm)
-    - y_new = 200 - z_old (where z_old is tag Z coordinate in cm)
+    - x_new = 100 + x_old (where x_old is camera X coordinate relative to tag in cm)
+    - y_new = 200 - z_old (where z_old is camera Z coordinate relative to tag in cm)
     - orientation = -old_pitch_angle (in degrees)
     
     Args:
-        tvec: Translation vector (tag position relative to camera) in meters
-        rvec: Rotation vector (tag rotation relative to camera)
+        tvec: Translation vector (camera position relative to tag) in meters
+        rvec: Rotation vector (camera rotation relative to tag)
     
     Returns:
         (x_map, y_map, yaw_map): Car position in map coordinates (cm, cm, degrees)
@@ -389,9 +389,9 @@ def transform_to_map_coordinates(tvec, rvec):
     pitch_rad = -atan2(R_tag[2, 0], sqrt(R_tag[2, 1]**2 + R_tag[2, 2]**2))
     pitch_deg = degrees(pitch_rad)
     
-    # Apply transformation: orientation = -old_pitch_angle
+    # Apply transformation: orientation = -old_pitch_angle, then invert (multiply by -1)
     # Then convert to map coordinate system where 0 = north, clockwise positive
-    yaw_map = -pitch_deg
+    yaw_map = pitch_deg  # Inverted orientation (was -pitch_deg, now pitch_deg)
     
     return x_map, y_map, yaw_map
 
@@ -435,12 +435,13 @@ def create_map_visualization(x_map, y_map, yaw_map):
         
         # Draw car orientation arrow
         # In map coordinates: 0 degrees = north (up), clockwise positive
-        # For drawing: 0 degrees = -90 degrees in standard math coordinates (upward)
+        # For drawing in image coordinates: 0 degrees = -90 degrees in standard math (upward)
         arrow_length = 12 * scale
         # Convert map yaw to drawing angle: map 0° (north) = -90° in standard coords
-        yaw_rad = np.radians(-yaw_map - 90)  # Negative because clockwise in map = counterclockwise in standard
+        # Map increases clockwise, standard increases counterclockwise, so negate
+        yaw_rad = np.radians(-yaw_map - 90)
         car_arrow_end_x = car_x_pixel + arrow_length * np.cos(yaw_rad)
-        car_arrow_end_y = car_y_pixel + arrow_length * np.sin(yaw_rad)  # Standard Y increases downward
+        car_arrow_end_y = car_y_pixel + arrow_length * np.sin(yaw_rad)  # Image Y increases downward
         cv2.arrowedLine(img, (int(car_x_pixel), int(car_y_pixel)),
                        (int(car_arrow_end_x), int(car_arrow_end_y)),
                        (0, 255, 0), 3, tipLength=0.3)
@@ -457,9 +458,7 @@ def create_map_visualization(x_map, y_map, yaw_map):
         cv2.circle(img, (int(car_x_pixel), int(car_y_pixel)), 6, (0, 165, 255), -1)  # Orange
         cv2.circle(img, (int(car_x_pixel), int(car_y_pixel)), 6, (0, 0, 0), 2)
     
-    # Add title and labels
-    cv2.putText(img, "MAP (200x200 cm)", (10, 25),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+    # Add labels (removed "MAP (200x200 cm)" title)
     cv2.putText(img, f"Car Position: ({x_map:.1f}, {y_map:.1f}) cm", (10, img_size - 50),
                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
     cv2.putText(img, f"Car Yaw: {yaw_map:.1f} deg (0°=North, CW+)", (10, img_size - 25),
@@ -574,17 +573,18 @@ def main():
                             draw_tag_axes(display_frame, camera_matrix, dist_coeffs, 
                                         rvec_cam, tvec_cam, TAG_SIZE)
                             
-                            # Invert pose: get tag pose relative to camera
-                            tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
+                            # Use camera pose relative to tag directly (tag is already origin)
+                            # No inversion needed - solvePnP already gives camera relative to tag
+                            # where tag is at origin
                             
-                            # Get pose information (tag relative to camera)
-                            pose_data = format_pose_info(tag_tvec, tag_rvec)
+                            # Get pose information (camera relative to tag, tag as origin)
+                            pose_data = format_pose_info(tvec_cam, rvec_cam)
                             
                             # Display pose info on image with readable formatting
                             draw_pose_info(display_frame, pose_data)
                             
-                            # Transform to map coordinates
-                            x_map, y_map, yaw_map = transform_to_map_coordinates(tag_tvec, tag_rvec)
+                            # Transform to map coordinates (using camera pose relative to tag)
+                            x_map, y_map, yaw_map = transform_to_map_coordinates(tvec_cam, rvec_cam)
                             
                             # Create and display map visualization
                             map_img = create_map_visualization(x_map, y_map, yaw_map)
@@ -621,17 +621,18 @@ def main():
                                 draw_tag_axes(display_frame, camera_matrix, dist_coeffs, 
                                             rvec_cam, tvec_cam, TAG_SIZE)
                                 
-                                # Invert pose: get tag pose relative to camera
-                                tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
+                                # Use camera pose relative to tag directly (tag is already origin)
+                                # No inversion needed - solvePnP already gives camera relative to tag
+                                # where tag is at origin
                                 
-                                # Get pose information (tag relative to camera)
-                                pose_data = format_pose_info(tag_tvec, tag_rvec)
+                                # Get pose information (camera relative to tag, tag as origin)
+                                pose_data = format_pose_info(tvec_cam, rvec_cam)
                                 
                                 # Display pose info on image with readable formatting
                                 draw_pose_info(display_frame, pose_data)
                                 
-                                # Transform to map coordinates
-                                x_map, y_map, yaw_map = transform_to_map_coordinates(tag_tvec, tag_rvec)
+                                # Transform to map coordinates (using camera pose relative to tag)
+                                x_map, y_map, yaw_map = transform_to_map_coordinates(tvec_cam, rvec_cam)
                                 
                                 # Create and display map visualization
                                 map_img = create_map_visualization(x_map, y_map, yaw_map)
@@ -643,6 +644,22 @@ def main():
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cv2.putText(display_frame, f"Looking for tag ID {TARGET_TAG_ID}", (10, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Show empty map without car representation when tag not detected
+                map_img_empty = np.ones((MAP_SIZE * 2, MAP_SIZE * 2, 3), dtype=np.uint8) * 240
+                # Draw grid
+                grid_spacing = 50
+                for i in range(0, MAP_SIZE + 1, grid_spacing):
+                    x_pixel = i * 2
+                    cv2.line(map_img_empty, (x_pixel, 0), (x_pixel, MAP_SIZE * 2), (200, 200, 200), 1)
+                    cv2.line(map_img_empty, (0, x_pixel), (MAP_SIZE * 2, x_pixel), (200, 200, 200), 1)
+                cv2.rectangle(map_img_empty, (0, 0), (MAP_SIZE * 2 - 1, MAP_SIZE * 2 - 1), (0, 0, 0), 2)
+                # Add axis labels
+                cv2.putText(map_img_empty, "X (East)", (MAP_SIZE * 2 - 80, MAP_SIZE * 2 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                cv2.putText(map_img_empty, "Y (North)", (10, 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                cv2.imshow("Map - Car Position", map_img_empty)
             
             # Resize for display if too large
             if display_frame.shape[1] > 1280:
@@ -662,8 +679,8 @@ def main():
                                 tag.corners, camera_matrix, dist_coeffs, TAG_SIZE
                             )
                             if success:
-                                tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
-                                distance = sqrt(sum(tag_tvec.flatten()**2))
+                                # Use camera pose relative to tag directly (no inversion)
+                                distance = sqrt(sum(tvec_cam.flatten()**2))
                                 print("\r" + " "*80, end="")  # Clear line
                                 print(f"\rTag detected! Distance: {distance*100:.2f} cm", end="")
                                 break
@@ -675,8 +692,8 @@ def main():
                                     corners[i], camera_matrix, dist_coeffs, TAG_SIZE
                                 )
                                 if success:
-                                    tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
-                                    distance = sqrt(sum(tag_tvec.flatten()**2))
+                                    # Use camera pose relative to tag directly (no inversion)
+                                    distance = sqrt(sum(tvec_cam.flatten()**2))
                                     print("\r" + " "*80, end="")  # Clear line
                                     print(f"\rTag detected! Distance: {distance*100:.2f} cm", end="")
                                     break
