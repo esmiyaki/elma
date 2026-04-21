@@ -584,6 +584,13 @@ def transform_to_map_coordinates(tvec, rvec, tag_id, tag_map_xy_cm=(100, 200)):
     return x_map, y_map, yaw_map
 
 
+def normalize_angle_deg_0_360(angle_deg):
+    """
+    Normalize an angle to the range [0, 360).
+    """
+    return angle_deg % 360.0
+
+
 def transform_to_map_coordinates_back_camera(tvec, rvec, tag_id, tag_map_xy_cm=(100, 200)):
     """
     Transform tag position to map coordinates when the pose comes from the BACK camera.
@@ -627,17 +634,19 @@ def transform_to_map_coordinates_back_camera(tvec, rvec, tag_id, tag_map_xy_cm=(
     pitch_rad = -atan2(R_tag[2, 0], sqrt(R_tag[2, 1] ** 2 + R_tag[2, 2] ** 2))
     pitch_deg = degrees(pitch_rad)
 
-    # Apply tag-specific yaw offset based on tag orientation (same offsets as front)
+    # Apply tag-specific yaw offset based on tag orientation (back camera needs 180° flip)
     if tag_id == 0:
-        yaw_map = pitch_deg
-    elif tag_id in [1, 2]:
-        yaw_map = pitch_deg - 90
-    elif tag_id == 3:
         yaw_map = pitch_deg + 180
+    elif tag_id in [1, 2]:
+        yaw_map = pitch_deg - 90 + 180
+    elif tag_id == 3:
+        yaw_map = pitch_deg + 180 + 180
     elif tag_id in [4, 5]:
-        yaw_map = pitch_deg + 90
+        yaw_map = pitch_deg + 90 + 180
     else:
-        yaw_map = pitch_deg
+        yaw_map = pitch_deg + 180
+
+    yaw_map = normalize_angle_deg_0_360(yaw_map)
 
     return x_map, y_map, yaw_map
 
