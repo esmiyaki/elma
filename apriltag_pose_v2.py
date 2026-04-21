@@ -584,6 +584,64 @@ def transform_to_map_coordinates(tvec, rvec, tag_id, tag_map_xy_cm=(100, 200)):
     return x_map, y_map, yaw_map
 
 
+def transform_to_map_coordinates_back_camera(tvec, rvec, tag_id, tag_map_xy_cm=(100, 200)):
+    """
+    Transform tag position to map coordinates when the pose comes from the BACK camera.
+
+    This uses a different tag-ID-specific translation mapping than the front camera
+    (as provided by the user), while keeping the same yaw extraction + tag orientation offsets.
+
+    Args:
+        tvec: Translation vector (tag position relative to BACK camera) in meters
+        rvec: Rotation vector (tag rotation relative to BACK camera)
+        tag_id: Tag ID (0-5) to determine transformation
+        tag_map_xy_cm: Tag's anchor position in map coordinates (cm)
+
+    Returns:
+        (x_map, y_map, yaw_map): Car position in map coordinates (cm, cm, degrees)
+    """
+    # Convert tvec from meters to cm
+    x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
+
+    tag_map_x, tag_map_y = tag_map_xy_cm
+
+    # Apply tag-specific transformation (BACK camera)
+    if tag_id == 0:
+        x_map = tag_map_x + x_tag
+        y_map = tag_map_y + z_tag
+    elif tag_id in [1, 2]:
+        x_map = tag_map_x + z_tag
+        y_map = tag_map_y + x_tag
+    elif tag_id == 3:
+        x_map = tag_map_x - x_tag
+        y_map = tag_map_y - z_tag
+    elif tag_id in [4, 5]:
+        x_map = tag_map_x - z_tag
+        y_map = tag_map_y - x_tag
+    else:
+        x_map = tag_map_x + x_tag
+        y_map = tag_map_y + z_tag
+
+    # Calculate pitch angle from rotation vector (same method as front)
+    R_tag, _ = cv2.Rodrigues(rvec)
+    pitch_rad = -atan2(R_tag[2, 0], sqrt(R_tag[2, 1] ** 2 + R_tag[2, 2] ** 2))
+    pitch_deg = degrees(pitch_rad)
+
+    # Apply tag-specific yaw offset based on tag orientation (same offsets as front)
+    if tag_id == 0:
+        yaw_map = pitch_deg
+    elif tag_id in [1, 2]:
+        yaw_map = pitch_deg - 90
+    elif tag_id == 3:
+        yaw_map = pitch_deg + 180
+    elif tag_id in [4, 5]:
+        yaw_map = pitch_deg + 90
+    else:
+        yaw_map = pitch_deg
+
+    return x_map, y_map, yaw_map
+
+
 def create_map_visualization(x_map, y_map, yaw_map):
     """
     Create a visualization of the map with car position.
@@ -754,7 +812,7 @@ def main():
                 camera_matrix,
                 dist_coeffs,
                 TAG_SIZE,
-                pose_adjust_fn=apply_yaw180_flip_to_pose,
+                pose_adjust_fn=None,
             )
 
             # Choose the closest tag across both cameras (distance is based on the raw pose).
@@ -780,7 +838,7 @@ def main():
             )
             draw_text_with_background(
                 display_back,
-                "BACK CAMERA (pose flipped 180° for mapping)",
+                "BACK CAMERA",
                 (10, 30),
                 font_scale=0.7,
                 thickness=2,
@@ -811,12 +869,20 @@ def main():
 
                 # Transform to map coordinates using this tag's known anchor point
                 tag_anchor_xy = TAG_MAP_POSITIONS_CM.get(chosen["tag_id"], (100, 200))
-                x_map, y_map, yaw_map = transform_to_map_coordinates(
-                    chosen["tag_tvec"],
-                    chosen["tag_rvec"],
-                    chosen["tag_id"],
-                    tag_map_xy_cm=tag_anchor_xy
-                )
+                if chosen_cam == "back":
+                    x_map, y_map, yaw_map = transform_to_map_coordinates_back_camera(
+                        chosen["raw_tag_tvec"],
+                        chosen["raw_tag_rvec"],
+                        chosen["tag_id"],
+                        tag_map_xy_cm=tag_anchor_xy,
+                    )
+                else:
+                    x_map, y_map, yaw_map = transform_to_map_coordinates(
+                        chosen["tag_tvec"],
+                        chosen["tag_rvec"],
+                        chosen["tag_id"],
+                        tag_map_xy_cm=tag_anchor_xy,
+                    )
 
                 # Create and display map visualization
                 map_img = create_map_visualization(x_map, y_map, yaw_map)
