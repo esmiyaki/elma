@@ -17,6 +17,11 @@ from camera_calibration import load_calibration, CALIBRATION_FILE
 TAG_FAMILY = "tag36h11"  # AprilTag family
 TAG_SIZE = 0.06  # Tag size in meters (6cm default - adjust based on your tag)
 
+# Multi-camera parameters (Raspberry Pi Camera Module 3 x2)
+# Front camera faces vehicle forward; back camera is mounted 180° opposite (back-to-back).
+FRONT_CAMERA_INDEX = 0
+BACK_CAMERA_INDEX = 1
+
 # Map coordinate system parameters
 MAP_SIZE = 200  # 200x200 cm map
 
@@ -190,6 +195,136 @@ def rotation_vector_to_euler(rvec):
         yaw = 0
     
     return degrees(roll), degrees(pitch), degrees(yaw)
+
+
+def apply_yaw180_flip_to_pose(tag_rvec, tag_tvec):
+    """
+    Convert a pose from a back-facing camera frame into the front/vehicle frame.
+
+    Assumes the back camera is rotated 180 degrees around the camera Y axis
+    (so X and Z invert: (x, z) -> (-x, -z)). This keeps distances unchanged,
+    but makes positions/orientations comparable to the front camera.
+
+    Args:
+        tag_rvec: Rotation vector (tag rotation relative to camera)
+        tag_tvec: Translation vector (tag position relative to camera)
+
+    Returns:
+        (tag_rvec_flipped, tag_tvec_flipped)
+    """
+    # 180° rotation about camera Y axis.
+    R_flip = np.array(
+        [[-1.0, 0.0, 0.0],
+         [0.0, 1.0, 0.0],
+         [0.0, 0.0, -1.0]],
+        dtype=np.float32,
+    )
+
+    R_tag, _ = cv2.Rodrigues(tag_rvec)
+    R_tag_flipped = R_flip @ R_tag
+    tag_rvec_flipped, _ = cv2.Rodrigues(R_tag_flipped)
+
+    tag_tvec_flipped = R_flip @ tag_tvec
+    return tag_rvec_flipped, tag_tvec_flipped
+
+
+def find_best_tag_in_frame(
+    frame_rgb,
+    detector,
+    detector_type,
+    camera_matrix,
+    dist_coeffs,
+    tag_size,
+    pose_adjust_fn=None,
+):
+    """
+    Detect tags in a frame, estimate pose for each supported tag ID, and return the closest.
+
+    Args:
+        frame_rgb: RGB image from Picamera2
+        detector: AprilTag detector object
+        detector_type: 'pyapriltags' or 'opencv'
+        camera_matrix: Camera intrinsic matrix
+        dist_coeffs: Distortion coefficients
+        tag_size: Tag size in meters
+        pose_adjust_fn: Optional function(tag_rvec, tag_tvec) -> (adj_rvec, adj_tvec)
+
+    Returns:
+        (display_frame_bgr, tag_found, best)
+        where best includes both raw and adjusted poses:
+          best['tag_rvec'], best['tag_tvec'] are adjusted if pose_adjust_fn provided,
+          best['raw_tag_rvec'], best['raw_tag_tvec'] always store the raw pose.
+    """
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    tags_result = detect_apriltag(gray, detector, detector_type)
+
+    display_frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    tag_found = False
+    best = None
+
+    def consider_candidate(tag_id_int, tag_corners, center_xy):
+        nonlocal best, tag_found
+        tag_found = True
+
+        # Draw tag outline + ID
+        corners_int = tag_corners.astype(int)
+        cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
+        cv2.putText(
+            display_frame,
+            f"ID: {tag_id_int}",
+            (center_xy[0] - 30, center_xy[1] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+
+        # Compute camera pose relative to tag (solvePnP result)
+        success, rvec_cam, tvec_cam = compute_camera_pose(
+            tag_corners, camera_matrix, dist_coeffs, tag_size
+        )
+        if not success:
+            return
+
+        # Invert pose: tag pose relative to camera (raw, camera's own frame)
+        raw_tag_rvec, raw_tag_tvec = invert_pose(rvec_cam, tvec_cam)
+        distance_m = float(sqrt(sum(raw_tag_tvec.flatten() ** 2)))
+
+        tag_rvec, tag_tvec = raw_tag_rvec, raw_tag_tvec
+        if pose_adjust_fn is not None:
+            tag_rvec, tag_tvec = pose_adjust_fn(raw_tag_rvec, raw_tag_tvec)
+
+        if best is None or distance_m < best["distance_m"]:
+            best = {
+                "tag_id": int(tag_id_int),
+                "distance_m": distance_m,
+                "raw_tag_rvec": raw_tag_rvec,
+                "raw_tag_tvec": raw_tag_tvec,
+                "tag_rvec": tag_rvec,
+                "tag_tvec": tag_tvec,
+                "rvec_cam": rvec_cam,
+                "tvec_cam": tvec_cam,
+                "tag_corners": tag_corners,
+                "tag_center": (int(center_xy[0]), int(center_xy[1])),
+            }
+
+    if detector_type == "pyapriltags":
+        for tag in tags_result:
+            if tag.tag_id in TAG_MAP_POSITIONS_CM:
+                tag_corners = tag.corners
+                center = tag.center.astype(int)
+                consider_candidate(int(tag.tag_id), tag_corners, (int(center[0]), int(center[1])))
+    else:
+        corners, ids, rejected = tags_result
+        if ids is not None and len(ids) > 0:
+            for i, tag_id in enumerate(ids.flatten()):
+                tag_id_int = int(tag_id)
+                if tag_id_int in TAG_MAP_POSITIONS_CM:
+                    tag_corners = corners[i]
+                    center = tag_corners.mean(axis=0).astype(int)
+                    consider_candidate(tag_id_int, tag_corners, (int(center[0]), int(center[1])))
+
+    return display_frame, tag_found, best
 
 
 def compute_camera_pose(tag_corners, camera_matrix, dist_coeffs, tag_size):
@@ -569,16 +704,25 @@ def main():
             print("  2. Or ensure OpenCV >= 4.7.0 with contrib modules")
             return
     
-    # Initialize camera
-    print("Initializing camera...")
-    picam2 = Picamera2()
-    config = picam2.create_preview_configuration(
+    # Initialize cameras
+    print("Initializing cameras...")
+    picam2_front = Picamera2(FRONT_CAMERA_INDEX)
+    picam2_back = Picamera2(BACK_CAMERA_INDEX)
+
+    config_front = picam2_front.create_preview_configuration(
         main={"size": (1920, 1080), "format": "RGB888"}
     )
-    picam2.configure(config)
-    picam2.start()
+    config_back = picam2_back.create_preview_configuration(
+        main={"size": (1920, 1080), "format": "RGB888"}
+    )
+
+    picam2_front.configure(config_front)
+    picam2_back.configure(config_back)
+
+    picam2_front.start()
+    picam2_back.start()
     
-    print("\nCamera ready. Looking for AprilTag...")
+    print("\nCameras ready. Looking for AprilTag...")
     print("Press 'q' to quit")
     print("="*60)
     
@@ -589,184 +733,186 @@ def main():
         next_frame_t = time.perf_counter()
 
         while True:
-            # Capture frame
-            frame = picam2.capture_array()
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            
-            # Detect AprilTags
-            tags_result = detect_apriltag(gray, detector, detector_type)
-            
-            # Convert to BGR for OpenCV drawing
-            display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            tag_found = False
-            best = None
-            # best = {
-            #   'tag_id': int,
-            #   'distance_m': float,
-            #   'tag_rvec': np.ndarray,
-            #   'tag_tvec': np.ndarray,
-            #   'rvec_cam': np.ndarray,
-            #   'tvec_cam': np.ndarray,
-            #   'tag_corners': np.ndarray,
-            #   'tag_center': (int, int),
-            # }
-            
-            # Process detected tags based on detector type
-            if detector_type == 'pyapriltags':
-                # pyapriltags returns a list of tag objects
-                for tag in tags_result:
-                    if tag.tag_id in TAG_MAP_POSITIONS_CM:
-                        tag_found = True
-                        
-                        # Get tag corners (in image coordinates)
-                        # pyapriltags returns corners as array of 4 points
-                        tag_corners = tag.corners
-                        
-                        # Draw tag outline
-                        corners_int = tag_corners.astype(int)
-                        cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
-                        
-                        # Draw tag ID
-                        center = tag.center.astype(int)
-                        cv2.putText(display_frame, f"ID: {tag.tag_id}", 
-                                   (center[0] - 30, center[1] - 20),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        # Compute camera pose relative to tag (original)
-                        success, rvec_cam, tvec_cam = compute_camera_pose(
-                            tag_corners, camera_matrix, dist_coeffs, TAG_SIZE
-                        )
-                        
-                        if success:
-                            # Invert pose: get tag pose relative to camera
-                            tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
-                            distance_m = float(sqrt(sum(tag_tvec.flatten()**2)))
+            # Capture frames from both cameras
+            frame_front = picam2_front.capture_array()
+            frame_back = picam2_back.capture_array()
 
-                            if best is None or distance_m < best['distance_m']:
-                                best = {
-                                    'tag_id': int(tag.tag_id),
-                                    'distance_m': distance_m,
-                                    'tag_rvec': tag_rvec,
-                                    'tag_tvec': tag_tvec,
-                                    'rvec_cam': rvec_cam,
-                                    'tvec_cam': tvec_cam,
-                                    'tag_corners': tag_corners,
-                                    'tag_center': (int(center[0]), int(center[1])),
-                                }
-            else:  # opencv
-                # OpenCV returns (corners, ids, rejected)
-                corners, ids, rejected = tags_result
-                if ids is not None and len(ids) > 0:
-                    for i, tag_id in enumerate(ids.flatten()):
-                        if int(tag_id) in TAG_MAP_POSITIONS_CM:
-                            tag_found = True
-                            
-                            # Get tag corners (in image coordinates)
-                            # OpenCV returns corners as (1, 4, 2) array
-                            tag_corners = corners[i]
-                            
-                            # Draw tag outline
-                            corners_int = tag_corners.astype(int)
-                            cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
-                            
-                            # Calculate center for drawing ID
-                            center = tag_corners.mean(axis=0).astype(int)
-                            cv2.putText(display_frame, f"ID: {tag_id}", 
-                                       (center[0] - 30, center[1] - 20),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            
-                            # Compute camera pose relative to tag (original)
-                            success, rvec_cam, tvec_cam = compute_camera_pose(
-                                tag_corners, camera_matrix, dist_coeffs, TAG_SIZE
-                            )
-                            
-                            if success:
-                                # Invert pose: get tag pose relative to camera
-                                tag_rvec, tag_tvec = invert_pose(rvec_cam, tvec_cam)
-                                distance_m = float(sqrt(sum(tag_tvec.flatten()**2)))
+            # Process each frame independently. For the back camera, flip pose into front/vehicle frame.
+            display_front, tag_found_front, best_front = find_best_tag_in_frame(
+                frame_front,
+                detector,
+                detector_type,
+                camera_matrix,
+                dist_coeffs,
+                TAG_SIZE,
+                pose_adjust_fn=None,
+            )
+            display_back, tag_found_back, best_back = find_best_tag_in_frame(
+                frame_back,
+                detector,
+                detector_type,
+                camera_matrix,
+                dist_coeffs,
+                TAG_SIZE,
+                pose_adjust_fn=apply_yaw180_flip_to_pose,
+            )
 
-                                if best is None or distance_m < best['distance_m']:
-                                    best = {
-                                        'tag_id': int(tag_id),
-                                        'distance_m': distance_m,
-                                        'tag_rvec': tag_rvec,
-                                        'tag_tvec': tag_tvec,
-                                        'rvec_cam': rvec_cam,
-                                        'tvec_cam': tvec_cam,
-                                        'tag_corners': tag_corners,
-                                        'tag_center': (int(center[0]), int(center[1])),
-                                    }
+            # Choose the closest tag across both cameras (distance is based on the raw pose).
+            chosen = None
+            chosen_cam = None  # 'front' or 'back'
+            if best_front is not None:
+                chosen = best_front
+                chosen_cam = "front"
+            if best_back is not None and (chosen is None or best_back["distance_m"] < chosen["distance_m"]):
+                chosen = best_back
+                chosen_cam = "back"
+
+            # Add camera labels
+            draw_text_with_background(
+                display_front,
+                "FRONT CAMERA",
+                (10, 30),
+                font_scale=0.9,
+                thickness=2,
+                text_color=(255, 255, 255),
+                bg_color=(0, 0, 0),
+                alpha=0.6,
+            )
+            draw_text_with_background(
+                display_back,
+                "BACK CAMERA (pose flipped 180° for mapping)",
+                (10, 30),
+                font_scale=0.7,
+                thickness=2,
+                text_color=(255, 255, 255),
+                bg_color=(0, 0, 0),
+                alpha=0.6,
+            )
 
             # If we have at least one valid tag, use the closest one for pose + map.
-            if best is not None:
+            if chosen is not None:
+                display_frame = display_front if chosen_cam == "front" else display_back
+
                 # Draw coordinate axes for the chosen (closest) tag
                 draw_tag_axes(
                     display_frame,
                     camera_matrix,
                     dist_coeffs,
-                    best['rvec_cam'],
-                    best['tvec_cam'],
+                    chosen["rvec_cam"],
+                    chosen["tvec_cam"],
                     TAG_SIZE
                 )
 
-                # Get pose information (tag relative to camera)
-                pose_data = format_pose_info(best['tag_tvec'], best['tag_rvec'])
+                # Get pose information (tag pose relative to vehicle/front frame; back camera is flipped)
+                pose_data = format_pose_info(chosen["tag_tvec"], chosen["tag_rvec"])
 
                 # Display pose info on image with readable formatting
                 draw_pose_info(display_frame, pose_data)
 
                 # Transform to map coordinates using this tag's known anchor point
-                tag_anchor_xy = TAG_MAP_POSITIONS_CM.get(best['tag_id'], (100, 200))
+                tag_anchor_xy = TAG_MAP_POSITIONS_CM.get(chosen["tag_id"], (100, 200))
                 x_map, y_map, yaw_map = transform_to_map_coordinates(
-                    best['tag_tvec'],
-                    best['tag_rvec'],
-                    best['tag_id'],
+                    chosen["tag_tvec"],
+                    chosen["tag_rvec"],
+                    chosen["tag_id"],
                     tag_map_xy_cm=tag_anchor_xy
                 )
 
                 # Create and display map visualization
                 map_img = create_map_visualization(x_map, y_map, yaw_map)
                 cv2.imshow("Map - Car Position", map_img)
-            
-            # Display status
-            if not tag_found:
-                cv2.putText(display_frame, "Tag not detected", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                cv2.putText(display_frame, f"Looking for tag IDs {sorted(TAG_MAP_POSITIONS_CM.keys())}", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                # Show empty map without car representation when tag not detected
+            else:
+                # Show empty map without car representation when tag not detected by either camera
                 map_img_empty = np.ones((MAP_SIZE * 2, MAP_SIZE * 2, 3), dtype=np.uint8) * 240
-                # Draw grid
                 grid_spacing = 50
                 for i in range(0, MAP_SIZE + 1, grid_spacing):
                     x_pixel = i * 2
                     cv2.line(map_img_empty, (x_pixel, 0), (x_pixel, MAP_SIZE * 2), (200, 200, 200), 1)
                     cv2.line(map_img_empty, (0, x_pixel), (MAP_SIZE * 2, x_pixel), (200, 200, 200), 1)
                 cv2.rectangle(map_img_empty, (0, 0), (MAP_SIZE * 2 - 1, MAP_SIZE * 2 - 1), (0, 0, 0), 2)
-                # Add axis labels
-                cv2.putText(map_img_empty, "X (East)", (MAP_SIZE * 2 - 80, MAP_SIZE * 2 - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-                cv2.putText(map_img_empty, "Y (North)", (10, 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                cv2.putText(
+                    map_img_empty,
+                    "X (East)",
+                    (MAP_SIZE * 2 - 80, MAP_SIZE * 2 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 0),
+                    1,
+                )
+                cv2.putText(
+                    map_img_empty,
+                    "Y (North)",
+                    (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 0),
+                    1,
+                )
                 cv2.imshow("Map - Car Position", map_img_empty)
             
-            # Resize for display if too large
-            if display_frame.shape[1] > 1280:
-                scale = 1280 / display_frame.shape[1]
-                new_width = int(display_frame.shape[1] * scale)
-                new_height = int(display_frame.shape[0] * scale)
-                display_frame = cv2.resize(display_frame, (new_width, new_height))
+            # Display status on each camera view
+            if not tag_found_front:
+                cv2.putText(
+                    display_front,
+                    "Tag not detected",
+                    (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                )
+            if not tag_found_back:
+                cv2.putText(
+                    display_back,
+                    "Tag not detected",
+                    (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                )
+
+            looking_for = f"Looking for tag IDs {sorted(TAG_MAP_POSITIONS_CM.keys())}"
+            cv2.putText(
+                display_front,
+                looking_for,
+                (10, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+            cv2.putText(
+                display_back,
+                looking_for,
+                (10, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
             
-            cv2.imshow("AprilTag Pose Estimation V2 (Tag Origin) - Press 'q' to quit", display_frame)
+            # Resize for display if too large
+            def resize_if_needed(img, max_w=1280):
+                if img.shape[1] <= max_w:
+                    return img
+                scale = max_w / img.shape[1]
+                new_w = int(img.shape[1] * scale)
+                new_h = int(img.shape[0] * scale)
+                return cv2.resize(img, (new_w, new_h))
+
+            display_front_resized = resize_if_needed(display_front)
+            display_back_resized = resize_if_needed(display_back)
+
+            cv2.imshow("AprilTag - FRONT (Press 'q' to quit)", display_front_resized)
+            cv2.imshow("AprilTag - BACK (Press 'q' to quit)", display_back_resized)
             
             # Print pose info to console
-            if best is not None:
+            if chosen is not None:
                 print("\r" + " "*120, end="")  # Clear line
                 print(
-                    f"\rUsing closest tag ID {best['tag_id']} @ anchor {TAG_MAP_POSITIONS_CM[best['tag_id']]} "
-                    f"| Distance: {best['distance_m']*100:.2f} cm",
+                    f"\rUsing {chosen_cam} cam | closest tag ID {chosen['tag_id']} @ anchor {TAG_MAP_POSITIONS_CM[chosen['tag_id']]} "
+                    f"| Distance: {chosen['distance_m']*100:.2f} cm",
                     end=""
                 )
             
@@ -788,11 +934,13 @@ def main():
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
     finally:
-        picam2.stop()
+        picam2_front.stop()
+        picam2_back.stop()
         cv2.destroyAllWindows()
         # Close both windows
         try:
-            cv2.destroyWindow("AprilTag Pose Estimation V2 (Tag Origin) - Press 'q' to quit")
+            cv2.destroyWindow("AprilTag - FRONT (Press 'q' to quit)")
+            cv2.destroyWindow("AprilTag - BACK (Press 'q' to quit)")
             cv2.destroyWindow("Map - Car Position")
         except:
             pass
