@@ -142,7 +142,7 @@ def maybe_init_viz():
 def main():
     # --- Config ---
     PATH_FILE = "planned_path.json"
-    SERIAL_PORT = "/dev/ttyACM0"  # adjust if needed
+    SERIAL_PORT = "/dev/ttyUSB0"  # adjust if needed
     BAUD = 115200
 
     LOOP_HZ = 15.0
