@@ -230,7 +230,10 @@ def main():
 
             # Map steering rad -> servo degrees with constraints
             steer_rad = clamp(steer_rad, -MAX_STEER_RAD_FOR_SERVO, MAX_STEER_RAD_FOR_SERVO)
-            servo_deg = SERVO_CENTER_DEG + (steer_rad / MAX_STEER_RAD_FOR_SERVO) * SERVO_MAX_DELTA_DEG
+            # IMPORTANT: vehicle model uses +steer = left (CCW yaw increase).
+            # Your servo wiring behaves as: higher degree -> RIGHT, lower degree -> LEFT.
+            # Therefore we invert the mapping so +steer commands a smaller servo angle.
+            servo_deg = SERVO_CENTER_DEG - (steer_rad / MAX_STEER_RAD_FOR_SERVO) * SERVO_MAX_DELTA_DEG
             servo_deg = clamp(servo_deg, SERVO_CENTER_DEG - SERVO_MAX_DELTA_DEG, SERVO_CENTER_DEG + SERVO_MAX_DELTA_DEG)
             # Rate-limit servo so it doesn't snap to large angles instantly
             max_delta = SERVO_MAX_SPEED_DEG_S * dt
@@ -253,7 +256,7 @@ def main():
                 artists["near_pt"].set_data([points[idx]["x_cm"]], [points[idx]["y_cm"]])
                 artists["txt"].set_text(
                     f"idx={idx}/{len(points)} dir={'F' if direction>0 else 'R'}\n"
-                    f"servo={servo_deg:.1f} thr={throttle}\n"
+                    f"steer={math.degrees(steer_rad):+.1f}deg servo={servo_deg:.1f} thr={throttle}\n"
                     f"goal_dist={dist_goal:.1f}cm"
                 )
                 fig.canvas.draw_idle()
