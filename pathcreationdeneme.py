@@ -12,6 +12,8 @@ import matplotlib.lines as mlines
 import heapq
 import math
 import sys
+import json
+import time
 
 sys.stdout.reconfigure(encoding='utf-8')
 from shapely.geometry import Polygon, box, Point
@@ -71,6 +73,36 @@ def add_exit_btn(fig):
         sys.exit(0)
     btn.on_clicked(on_exit)
     return btn
+
+def save_path_json(path, start_pose, target_slot_id, target_pose, filename="planned_path.json"):
+    """
+    Save planned path to a JSON file for the Raspberry Pi controller.
+    Path points are stored in cm/rad with direction (+1 forward / -1 reverse).
+    """
+    data = {
+        "version": 1,
+        "generated_at_unix_s": time.time(),
+        "map_size_cm": MAP_SIZE,
+        "start": {"x_cm": float(start_pose[0]), "y_cm": float(start_pose[1]), "yaw_rad": float(start_pose[2])},
+        "target": {
+            "slot_id": int(target_slot_id),
+            "x_cm": float(target_pose[0]),
+            "y_cm": float(target_pose[1]),
+            "yaw_rad": float(target_pose[2]),
+        },
+        "points": [
+            {
+                "x_cm": float(x),
+                "y_cm": float(y),
+                "yaw_rad": float(yaw),
+                "direction": int(d),
+                "steer_rad": float(steer),
+            }
+            for (x, y, yaw, d, steer) in path
+        ],
+    }
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 # --- REEDS-SHEPP SOLVER ---
 class ReedsSheppPlanner:
@@ -374,7 +406,7 @@ def run_simulation():
 
     target = next(s for s in slots if s["id"] == sel.target_id)
 
-    # Try reverse first; if it fails, try forward automatically (no popups).
+    # Try forward first; if it fails, try reverse automatically (no popups).
     yaw_reverse = target["yaw"]
     yaw_forward = normalize_angle(target["yaw"] + np.pi)
 
@@ -384,16 +416,24 @@ def run_simulation():
     )
     print(f"[PLAN] target slot={sel.target_id} at ({target['cx']:.1f},{target['cy']:.1f})")
 
-    path, success = hybrid_a_star(start_pose, (target["cx"], target["cy"], yaw_reverse), obs_list)
-    final_mode_str = "REVERSE"
+    path, success = hybrid_a_star(start_pose, (target["cx"], target["cy"], yaw_forward), obs_list)
+    final_mode_str = "FORWARD"
 
     if not success:
-        print("[!] Reverse plan failed. Trying forward...")
-        path, success = hybrid_a_star(start_pose, (target["cx"], target["cy"], yaw_forward), obs_list)
-        final_mode_str = "FORWARD" if success else "NONE"
+        print("[!] Forward plan failed. Trying reverse...")
+        path, success = hybrid_a_star(start_pose, (target["cx"], target["cy"], yaw_reverse), obs_list)
+        final_mode_str = "REVERSE" if success else "NONE"
 
     if not success:
         return
+
+    # Write planned path for the controller (Raspberry Pi)
+    target_pose = (target["cx"], target["cy"], yaw_forward if final_mode_str == "FORWARD" else yaw_reverse)
+    try:
+        save_path_json(path, start_pose, sel.target_id, target_pose, filename="planned_path.json")
+        print("[OK] Wrote planned path to planned_path.json")
+    except Exception as e:
+        print(f"[!] Could not write planned_path.json: {e}")
 
     # --- PLOTTING ---
     fig, ax = plt.subplots(figsize=(9, 10))
