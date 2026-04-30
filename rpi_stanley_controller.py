@@ -14,6 +14,14 @@ def wrap_pi(a: float) -> float:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+def dist_cm(p1, p2) -> float:
+    dx = float(p1["x_cm"]) - float(p2["x_cm"])
+    dy = float(p1["y_cm"]) - float(p2["y_cm"])
+    return math.hypot(dx, dy)
+
+def angle_diff_rad(a: float, b: float) -> float:
+    return wrap_pi(a - b)
+
 def rate_limit(value: float, prev: float, max_delta: float) -> float:
     """
     Limit how much 'value' can change from 'prev' by max_delta.
@@ -52,6 +60,22 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
             best_d2 = d2
             best_i = i
     return best_i
+
+
+def initial_motion_index(points, lookahead=50):
+    """
+    If the first point is a static initial pose, its direction can be a default (+1).
+    Find the first index within a short window whose direction indicates actual motion.
+    """
+    if not points:
+        return 0
+    d0 = int(points[0].get("direction", 1))
+    n = min(len(points), max(1, int(lookahead)))
+    for i in range(1, n):
+        di = int(points[i].get("direction", d0))
+        if di != d0:
+            return i
+    return 0
 
 
 def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
@@ -146,7 +170,7 @@ def main():
     BAUD = 115200
 
     LOOP_HZ = 15.0
-    POSE_TIMEOUT_S = 0.7
+    POSE_TIMEOUT_S = 0.25
     CMD_TIMEOUT_S = 0.5
 
     # steering mapping (servo)
@@ -158,8 +182,16 @@ def main():
     # throttle mapping
     THROTTLE_FWD = 160  # 0..255
     THROTTLE_REV = 140  # 0..255 (often safer a bit lower)
-    SLOWDOWN_DIST_CM = 25.0
+    SLOWDOWN_DIST_CM = 45.0
     GEAR_CHANGE_SERVO_SETTLE_S = 2.0  # pause motor on gear change; steer first
+    TURN_PWM_BOOST_MAX = 15  # extra PWM at full steering
+    THROTTLE_MIN_MOVING = 110  # don't go below this unless stopping
+
+    # Localization jump filter
+    LOCAL_JUMP_DIST_CM = 25.0
+    LOCAL_PENDING_MATCH_CYCLES = 5
+    LOCAL_PENDING_POS_TOL_CM = 6.0
+    LOCAL_PENDING_YAW_TOL_DEG = 12.0
 
     # --- Load path ---
     meta, points = load_path(PATH_FILE)
@@ -175,11 +207,16 @@ def main():
 
     last_pose_t = 0.0
     last_cmd_t = 0.0
-    idx = 0
+    idx = initial_motion_index(points, lookahead=80)
     last_pose = None
     last_servo_deg = SERVO_CENTER_DEG
     last_direction = None  # +1 forward / -1 reverse
     gear_change_until_t = 0.0
+    startup_until_t = time.perf_counter() + GEAR_CHANGE_SERVO_SETTLE_S
+    accepted_pose = None
+    pending_pose = None
+    pending_count = 0
+    localization_hold = False
 
     # Optional debug visualization
     viz = maybe_init_viz()
@@ -205,7 +242,40 @@ def main():
                 # controller yaw: 0 rad=+X, CCW+
                 yaw_rad = wrap_pi(math.radians(float(p["yaw_deg"])) + (math.pi / 2.0))
                 pose = {"x_cm": float(p["x_cm"]), "y_cm": float(p["y_cm"]), "yaw_rad": yaw_rad}
-                last_pose = pose
+                # Jump filter: if pose jumps > 25cm, only accept after 5 consistent cycles.
+                # While a jump is pending, we hold the motor stopped until localization is valid again.
+                localization_hold = False
+                if accepted_pose is None:
+                    accepted_pose = pose
+                    pending_pose = None
+                    pending_count = 0
+                else:
+                    d = dist_cm(pose, accepted_pose)
+                    if d <= LOCAL_JUMP_DIST_CM:
+                        accepted_pose = pose
+                        pending_pose = None
+                        pending_count = 0
+                    else:
+                        # candidate jump; require several matching cycles
+                        localization_hold = True
+                        if pending_pose is None:
+                            pending_pose = pose
+                            pending_count = 1
+                        else:
+                            d_pend = dist_cm(pose, pending_pose)
+                            yaw_ok = abs(math.degrees(angle_diff_rad(pose["yaw_rad"], pending_pose["yaw_rad"]))) <= LOCAL_PENDING_YAW_TOL_DEG
+                            if d_pend <= LOCAL_PENDING_POS_TOL_CM and yaw_ok:
+                                pending_count += 1
+                            else:
+                                pending_pose = pose
+                                pending_count = 1
+                        if pending_count >= LOCAL_PENDING_MATCH_CYCLES:
+                            accepted_pose = pending_pose
+                            pending_pose = None
+                            pending_count = 0
+                            localization_hold = False
+
+                last_pose = accepted_pose
                 last_pose_t = time.perf_counter()
 
             now = time.perf_counter()
@@ -237,7 +307,9 @@ def main():
 
             throttle = int((THROTTLE_FWD if direction > 0 else THROTTLE_REV) * scale)
             throttle = throttle if direction > 0 else -throttle
-            if time.perf_counter() < gear_change_until_t:
+            if time.perf_counter() < gear_change_until_t or time.perf_counter() < startup_until_t:
+                throttle = 0
+            if localization_hold:
                 throttle = 0
 
             # Map steering rad -> servo degrees with constraints
@@ -249,6 +321,24 @@ def main():
             max_delta = SERVO_MAX_SPEED_DEG_S * dt
             servo_deg = rate_limit(servo_deg, last_servo_deg, max_delta=max_delta)
             last_servo_deg = servo_deg
+
+            # Turn-dependent PWM boost (linear): 0 at center, +15 at max steering
+            if throttle != 0:
+                turn_ratio = abs(servo_deg - SERVO_CENTER_DEG) / SERVO_MAX_DELTA_DEG
+                turn_ratio = clamp(turn_ratio, 0.0, 1.0)
+                boost = int(round(TURN_PWM_BOOST_MAX * turn_ratio))
+                if throttle > 0:
+                    throttle = min(255, throttle + boost)
+                else:
+                    throttle = max(-255, throttle - boost)
+
+            # Enforce minimum moving throttle so we don't stop too early when slowing down.
+            # If we are truly stopping (very close to goal), end condition below will handle STOP.
+            if throttle != 0 and dist_goal > 3.0:
+                if 0 < throttle < THROTTLE_MIN_MOVING:
+                    throttle = THROTTLE_MIN_MOVING
+                elif 0 > throttle > -THROTTLE_MIN_MOVING:
+                    throttle = -THROTTLE_MIN_MOVING
 
             # Send command
             line = f"CMD {servo_deg:.1f} {throttle}\n".encode("ascii")
