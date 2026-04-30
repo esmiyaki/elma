@@ -30,9 +30,9 @@ XY_TOLERANCE = 0.1
 YAW_TOLERANCE = np.deg2rad(0.5) 
 
 # Car Specs
-CAR_L, CAR_W = 25.0, 15.0
-WB = CAR_L * 0.65
-MAX_STEER = np.deg2rad(35.0) 
+CAR_L, CAR_W = 25.0, 18.0
+WB = CAR_L * 0.75
+MAX_STEER = np.deg2rad(25.0) 
 
 SLOT_W, SLOT_D = 25.0, 40.0  
 
@@ -353,15 +353,30 @@ def hybrid_a_star(start, goal, obstacles):
     return [], False
 
 def create_slots():
-    slots, counter = [], 1
-    total_w_top = 3 * SLOT_W; start_x_top = (MAP_SIZE - total_w_top) / 2 + (SLOT_W / 2)
-    for i in range(3):
-        slots.append({'cx': start_x_top + (i * SLOT_W), 'cy': MAP_SIZE - (SLOT_D / 2), 'yaw': -np.pi/2, 'id': counter}); counter += 1
-    total_h_side = 6 * SLOT_W; start_y_side = (MAP_SIZE - total_h_side) / 2 + (SLOT_W / 2)
-    for i in range(6):
-        slots.append({'cx': SLOT_D / 2, 'cy': start_y_side + (i * SLOT_W), 'yaw': 0, 'id': counter}); counter += 1
-    for i in range(6):
-        slots.append({'cx': MAP_SIZE - (SLOT_D / 2), 'cy': start_y_side + (i * SLOT_W), 'yaw': np.pi, 'id': counter}); counter += 1
+    # Slot midpoints (cx, cy) in cm as provided by user.
+    # Slots are 25x40 cm (SLOT_W x SLOT_D).
+    #
+    # Yaw convention in this file:
+    #   0 rad = +X (east), CCW positive.
+    # Wall-based slot orientation:
+    #   - Top wall (y high): face down  => -pi/2
+    #   - Bottom wall (y low): face up => +pi/2
+    #   - Left wall (x low): face right => 0
+    #   - Right wall (x high): face left => pi
+    slots = [
+        {"id": 1, "cx": 112.5, "cy": 180.0, "yaw": -np.pi / 2},
+        {"id": 2, "cx": 180.0, "cy": 137.5, "yaw": np.pi},
+        {"id": 3, "cx": 180.0, "cy": 112.5, "yaw": np.pi},
+        {"id": 4, "cx": 180.0, "cy": 87.5, "yaw": np.pi},
+        {"id": 5, "cx": 180.0, "cy": 62.5, "yaw": np.pi},
+        {"id": 6, "cx": 112.5, "cy": 20.0, "yaw": np.pi / 2},
+        {"id": 7, "cx": 87.5, "cy": 20.0, "yaw": np.pi / 2},
+        {"id": 8, "cx": 20.0, "cy": 62.5, "yaw": 0.0},
+        {"id": 9, "cx": 20.0, "cy": 87.5, "yaw": 0.0},
+        {"id": 10, "cx": 20.0, "cy": 112.5, "yaw": 0.0},
+        {"id": 11, "cx": 20.0, "cy": 137.5, "yaw": 0.0},
+        {"id": 12, "cx": 87.5, "cy": 180.0, "yaw": -np.pi / 2},
+    ]
     return slots
 
 # --- SIMULATION LOGIC ---
