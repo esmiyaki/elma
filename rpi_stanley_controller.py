@@ -62,22 +62,6 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     return best_i
 
 
-def initial_motion_index(points, lookahead=50):
-    """
-    If the first point is a static initial pose, its direction can be a default (+1).
-    Find the first index within a short window whose direction indicates actual motion.
-    """
-    if not points:
-        return 0
-    d0 = int(points[0].get("direction", 1))
-    n = min(len(points), max(1, int(lookahead)))
-    for i in range(1, n):
-        di = int(points[i].get("direction", d0))
-        if di != d0:
-            return i
-    return 0
-
-
 def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     """
     Stanley controller in map frame.
@@ -207,7 +191,7 @@ def main():
 
     last_pose_t = 0.0
     last_cmd_t = 0.0
-    idx = initial_motion_index(points, lookahead=80)
+    idx = 0
     last_pose = None
     last_servo_deg = SERVO_CENTER_DEG
     last_direction = None  # +1 forward / -1 reverse
