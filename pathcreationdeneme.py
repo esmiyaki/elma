@@ -38,10 +38,10 @@ SLOT_W, SLOT_D = 25.0, 40.0
 
 # Pathfinding Weights
 SPEED = 5.0
-COST_STEER = 2.0            
+COST_STEER = 0.5            
 COST_GEAR_SWITCH = 10.0   
-COST_STEER_CHANGE = 5.0   
-H_WEIGHT = 4.0              
+COST_STEER_CHANGE = 1.0   
+H_WEIGHT = 1.0              
 
 # Reeds-Shepp Constants
 ANALYTIC_SHOT_DIST = 40.0   
@@ -421,6 +421,16 @@ def run_simulation():
 
     target = next(s for s in slots if s["id"] == sel.target_id)
 
+    # Goal point: move 10cm deeper into the parking slot (toward the wall).
+    # Slot midpoints stay the same; only the planning/target point is shifted.
+    # Example: top slot midpoint (112.5, 180) -> goal (112.5, 190)
+    PARK_INSET_CM = 10.0
+    # Our slot yaw points "into the map" from the wall, so "toward the wall" is -forward.
+    wall_dx = -np.cos(target["yaw"])
+    wall_dy = -np.sin(target["yaw"])
+    goal_x = float(target["cx"] + PARK_INSET_CM * wall_dx)
+    goal_y = float(target["cy"] + PARK_INSET_CM * wall_dy)
+
     # Try forward first; if it fails, try reverse automatically (no popups).
     yaw_reverse = target["yaw"]
     yaw_forward = normalize_angle(target["yaw"] + np.pi)
@@ -429,21 +439,24 @@ def run_simulation():
         f"\n[POSE] start=({start_x:.1f},{start_y:.1f},{np.rad2deg(start_yaw):.1f}deg std) "
         f"| from tag {pose['tag_id']} ({pose['camera']}) dist={pose['distance_cm']:.1f}cm"
     )
-    print(f"[PLAN] target slot={sel.target_id} at ({target['cx']:.1f},{target['cy']:.1f})")
+    print(
+        f"[PLAN] target slot={sel.target_id} midpoint=({target['cx']:.1f},{target['cy']:.1f}) "
+        f"goal=({goal_x:.1f},{goal_y:.1f})"
+    )
 
-    path, success = hybrid_a_star(start_pose, (target["cx"], target["cy"], yaw_forward), obs_list)
+    path, success = hybrid_a_star(start_pose, (goal_x, goal_y, yaw_forward), obs_list)
     final_mode_str = "FORWARD"
 
     if not success:
         print("[!] Forward plan failed. Trying reverse...")
-        path, success = hybrid_a_star(start_pose, (target["cx"], target["cy"], yaw_reverse), obs_list)
+        path, success = hybrid_a_star(start_pose, (goal_x, goal_y, yaw_reverse), obs_list)
         final_mode_str = "REVERSE" if success else "NONE"
 
     if not success:
         return
 
     # Write planned path for the controller (Raspberry Pi)
-    target_pose = (target["cx"], target["cy"], yaw_forward if final_mode_str == "FORWARD" else yaw_reverse)
+    target_pose = (goal_x, goal_y, yaw_forward if final_mode_str == "FORWARD" else yaw_reverse)
     try:
         save_path_json(path, start_pose, sel.target_id, target_pose, filename="planned_path.json")
         print("[OK] Wrote planned path to planned_path.json")
@@ -463,7 +476,7 @@ def run_simulation():
     for o in obs_list: ax.fill(*o.exterior.xy, color='#2f4f4f') 
     p_target = translate(rotate(box(-SLOT_D/2,-SLOT_W/2,SLOT_D/2,SLOT_W/2), target['yaw'], use_radians=True), target['cx'], target['cy'])
     ax.fill(*p_target.exterior.xy, color='#98fb98', alpha=0.5) 
-    ax.plot(target['cx'], target['cy'], 'rx', markersize=8)
+    ax.plot(goal_x, goal_y, 'rx', markersize=8)
 
     if path and len(path) > 1:
         seg_x, seg_y, curr_dir = [path[0][0]], [path[0][1]], path[0][3]
