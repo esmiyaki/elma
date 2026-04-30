@@ -276,11 +276,11 @@ def main():
 
             steer_rad, idx, direction = stanley_control(points, last_pose, idx)
 
-            # Slow down near final target
+            # Distance-to-goal (used for STOP condition / debug only)
             gx = float(points[-1]["x_cm"])
             gy = float(points[-1]["y_cm"])
             dist_goal = math.hypot(last_pose["x_cm"] - gx, last_pose["y_cm"] - gy)
-            scale = clamp(dist_goal / SLOWDOWN_DIST_CM, 0.2, 1.0)
+            scale = 1.0  # do not slow down while parking (per user request)
 
             # Detect gear change (direction flip) and pause motor to let steering settle first.
             if last_direction is None:
