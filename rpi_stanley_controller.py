@@ -97,10 +97,10 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     cte = dx * left_nx + dy * left_ny  # +: vehicle is left of path
 
     # Use nominal speed magnitude (cm/s) for Stanley term; softening avoids blow-up near zero.
-    v = 40.0
+    v = 20.0
     cte_term = math.atan2(k * cte, (v + softening))
 
-    steer = heading_err + cte_term
+    steer = -heading_err + cte_term
     steer = wrap_pi(steer)
     return steer, int(idx), direction
 
@@ -159,6 +159,7 @@ def main():
     THROTTLE_FWD = 160  # 0..255
     THROTTLE_REV = 140  # 0..255 (often safer a bit lower)
     SLOWDOWN_DIST_CM = 25.0
+    GEAR_CHANGE_SERVO_SETTLE_S = 2.0  # pause motor on gear change; steer first
 
     # --- Load path ---
     meta, points = load_path(PATH_FILE)
@@ -177,6 +178,8 @@ def main():
     idx = 0
     last_pose = None
     last_servo_deg = SERVO_CENTER_DEG
+    last_direction = None  # +1 forward / -1 reverse
+    gear_change_until_t = 0.0
 
     # Optional debug visualization
     viz = maybe_init_viz()
@@ -225,11 +228,21 @@ def main():
             dist_goal = math.hypot(last_pose["x_cm"] - gx, last_pose["y_cm"] - gy)
             scale = clamp(dist_goal / SLOWDOWN_DIST_CM, 0.2, 1.0)
 
+            # Detect gear change (direction flip) and pause motor to let steering settle first.
+            if last_direction is None:
+                last_direction = int(direction)
+            if int(direction) != int(last_direction):
+                gear_change_until_t = time.perf_counter() + GEAR_CHANGE_SERVO_SETTLE_S
+                last_direction = int(direction)
+
             throttle = int((THROTTLE_FWD if direction > 0 else THROTTLE_REV) * scale)
             throttle = throttle if direction > 0 else -throttle
+            if time.perf_counter() < gear_change_until_t:
+                throttle = 0
 
             # Map steering rad -> servo degrees with constraints
             steer_rad = clamp(steer_rad, -MAX_STEER_RAD_FOR_SERVO, MAX_STEER_RAD_FOR_SERVO)
+            # Steering sign/mapping intentionally left as-is (per user request).
             servo_deg = SERVO_CENTER_DEG + (steer_rad / MAX_STEER_RAD_FOR_SERVO) * SERVO_MAX_DELTA_DEG
             servo_deg = clamp(servo_deg, SERVO_CENTER_DEG - SERVO_MAX_DELTA_DEG, SERVO_CENTER_DEG + SERVO_MAX_DELTA_DEG)
             # Rate-limit servo so it doesn't snap to large angles instantly
@@ -253,7 +266,7 @@ def main():
                 artists["near_pt"].set_data([points[idx]["x_cm"]], [points[idx]["y_cm"]])
                 artists["txt"].set_text(
                     f"idx={idx}/{len(points)} dir={'F' if direction>0 else 'R'}\n"
-                    f"servo={servo_deg:.1f} thr={throttle}\n"
+                    f"steer={math.degrees(steer_rad):+.1f}deg servo={servo_deg:.1f} thr={throttle}\n"
                     f"goal_dist={dist_goal:.1f}cm"
                 )
                 fig.canvas.draw_idle()
