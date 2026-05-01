@@ -79,6 +79,24 @@ def save_path_json(path, start_pose, target_slot_id, target_pose, filename="plan
     Save planned path to a JSON file for the Raspberry Pi controller.
     Path points are stored in cm/rad with direction (+1 forward / -1 reverse).
     """
+    points = [
+        {
+            "x_cm": float(x),
+            "y_cm": float(y),
+            "yaw_rad": float(yaw),
+            "direction": int(d),
+            "steer_rad": float(steer),
+        }
+        for (x, y, yaw, d, steer) in path
+    ]
+
+    # Fix: the first point is the initial pose and can carry default direction=+1,
+    # even if the first actual motion is reverse. Make point[0].direction match the
+    # first motion segment to avoid blocking reverse at startup.
+    if len(points) >= 2:
+        points[0]["direction"] = int(points[1]["direction"])
+        points[0]["steer_rad"] = float(points[1]["steer_rad"])
+
     data = {
         "version": 1,
         "generated_at_unix_s": time.time(),
@@ -90,16 +108,7 @@ def save_path_json(path, start_pose, target_slot_id, target_pose, filename="plan
             "y_cm": float(target_pose[1]),
             "yaw_rad": float(target_pose[2]),
         },
-        "points": [
-            {
-                "x_cm": float(x),
-                "y_cm": float(y),
-                "yaw_rad": float(yaw),
-                "direction": int(d),
-                "steer_rad": float(steer),
-            }
-            for (x, y, yaw, d, steer) in path
-        ],
+        "points": points,
     }
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -211,6 +220,7 @@ class TargetSlotSelector:
     def __init__(self, slots):
         self.slots = slots
         self.target_id = None
+        self.parking_mode = "AUTO"  # "AUTO" | "FORWARD" | "REVERSE"
         self.done = False
 
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
@@ -237,10 +247,34 @@ class TargetSlotSelector:
             self.ax.text(s["cx"], s["cy"], str(s["id"]), ha="center", va="center", fontweight="bold")
             s["poly_geom"] = p
 
+        # Parking mode buttons
+        ax_auto = plt.axes([0.05, 0.02, 0.18, 0.06])
+        ax_fwd = plt.axes([0.25, 0.02, 0.18, 0.06])
+        ax_rev = plt.axes([0.45, 0.02, 0.18, 0.06])
+        self.btn_auto = Button(ax_auto, "AUTO", color="#e0e0e0", hovercolor="#c0c0c0")
+        self.btn_fwd = Button(ax_fwd, "FORWARD", color="white", hovercolor="#c0c0c0")
+        self.btn_rev = Button(ax_rev, "REVERSE", color="white", hovercolor="#c0c0c0")
+        self.btn_auto.on_clicked(lambda event: self._set_mode("AUTO"))
+        self.btn_fwd.on_clicked(lambda event: self._set_mode("FORWARD"))
+        self.btn_rev.on_clicked(lambda event: self._set_mode("REVERSE"))
+
         ax_btn = plt.axes([0.75, 0.02, 0.2, 0.06])
         self.btn = Button(ax_btn, "CONFIRM", color="#e0e0e0", hovercolor="#c0c0c0")
         self.btn.on_clicked(self._on_confirm)
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+
+        self._set_mode(self.parking_mode)
+
+    def _set_mode(self, mode: str):
+        self.parking_mode = mode
+        # simple visual highlight
+        self.btn_auto.color = "#e0e0e0" if mode == "AUTO" else "white"
+        self.btn_fwd.color = "#e0e0e0" if mode == "FORWARD" else "white"
+        self.btn_rev.color = "#e0e0e0" if mode == "REVERSE" else "white"
+        self.btn_auto.hovercolor = "#c0c0c0"
+        self.btn_fwd.hovercolor = "#c0c0c0"
+        self.btn_rev.hovercolor = "#c0c0c0"
+        self.fig.canvas.draw_idle()
 
     def _setup_plot(self):
         self.ax.set_xlim(0, MAP_SIZE)
@@ -433,17 +467,23 @@ def run_simulation():
 
     target = next(s for s in slots if s["id"] == sel.target_id)
 
-    # Goal point: move 10cm deeper into the parking slot (toward the wall).
+    # Goal point offset relative to slot midpoint.
+    # - Forward parking: aim 10cm deeper into the slot (toward the wall).
+    # - Reverse parking: aim 10cm outward (away from the wall).
     # Slot midpoints stay the same; only the planning/target point is shifted.
-    # Example: top slot midpoint (112.5, 180) -> goal (112.5, 190)
     PARK_INSET_CM = 10.0
     # Our slot yaw points "into the map" from the wall, so "toward the wall" is -forward.
     wall_dx = -np.cos(target["yaw"])
     wall_dy = -np.sin(target["yaw"])
-    goal_x = float(target["cx"] + PARK_INSET_CM * wall_dx)
-    goal_y = float(target["cy"] + PARK_INSET_CM * wall_dy)
+    goal_in_x = float(target["cx"] + PARK_INSET_CM * wall_dx)
+    goal_in_y = float(target["cy"] + PARK_INSET_CM * wall_dy)
+    goal_out_x = float(target["cx"] - PARK_INSET_CM * wall_dx)
+    goal_out_y = float(target["cy"] - PARK_INSET_CM * wall_dy)
 
-    # Try forward first; if it fails, try reverse automatically (no popups).
+    # Parking mode selection:
+    # - AUTO: try forward then reverse
+    # - FORWARD: only forward
+    # - REVERSE: only reverse
     yaw_reverse = target["yaw"]
     yaw_forward = normalize_angle(target["yaw"] + np.pi)
 
@@ -453,22 +493,34 @@ def run_simulation():
     )
     print(
         f"[PLAN] target slot={sel.target_id} midpoint=({target['cx']:.1f},{target['cy']:.1f}) "
-        f"goal=({goal_x:.1f},{goal_y:.1f})"
+        f"goal_in=({goal_in_x:.1f},{goal_in_y:.1f}) goal_out=({goal_out_x:.1f},{goal_out_y:.1f})"
     )
 
-    path, success = hybrid_a_star(start_pose, (goal_x, goal_y, yaw_forward), obs_list)
-    final_mode_str = "FORWARD"
+    chosen_goal_x = None
+    chosen_goal_y = None
+    path = []
+    success = False
+    final_mode_str = "NONE"
 
-    if not success:
-        print("[!] Forward plan failed. Trying reverse...")
-        path, success = hybrid_a_star(start_pose, (goal_x, goal_y, yaw_reverse), obs_list)
+    if sel.parking_mode in ("AUTO", "FORWARD"):
+        # Forward attempt uses deeper goal.
+        chosen_goal_x, chosen_goal_y = goal_in_x, goal_in_y
+        path, success = hybrid_a_star(start_pose, (goal_in_x, goal_in_y, yaw_forward), obs_list)
+        final_mode_str = "FORWARD" if success else "NONE"
+
+    if (not success) and sel.parking_mode in ("AUTO", "REVERSE"):
+        if sel.parking_mode == "AUTO":
+            print("[!] Forward plan failed. Trying reverse...")
+        # Reverse attempt uses outward goal.
+        chosen_goal_x, chosen_goal_y = goal_out_x, goal_out_y
+        path, success = hybrid_a_star(start_pose, (goal_out_x, goal_out_y, yaw_reverse), obs_list)
         final_mode_str = "REVERSE" if success else "NONE"
 
     if not success:
         return
 
     # Write planned path for the controller (Raspberry Pi)
-    target_pose = (goal_x, goal_y, yaw_forward if final_mode_str == "FORWARD" else yaw_reverse)
+    target_pose = (chosen_goal_x, chosen_goal_y, yaw_forward if final_mode_str == "FORWARD" else yaw_reverse)
     try:
         save_path_json(path, start_pose, sel.target_id, target_pose, filename="planned_path.json")
         print("[OK] Wrote planned path to planned_path.json")
@@ -488,7 +540,7 @@ def run_simulation():
     for o in obs_list: ax.fill(*o.exterior.xy, color='#2f4f4f') 
     p_target = translate(rotate(box(-SLOT_D/2,-SLOT_W/2,SLOT_D/2,SLOT_W/2), target['yaw'], use_radians=True), target['cx'], target['cy'])
     ax.fill(*p_target.exterior.xy, color='#98fb98', alpha=0.5) 
-    ax.plot(goal_x, goal_y, 'rx', markersize=8)
+    ax.plot(chosen_goal_x, chosen_goal_y, 'rx', markersize=8)
 
     if path and len(path) > 1:
         seg_x, seg_y, curr_dir = [path[0][0]], [path[0][1]], path[0][3]
