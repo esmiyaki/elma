@@ -291,24 +291,23 @@ def find_best_tag_in_frame(
         raw_tag_rvec, raw_tag_tvec = invert_pose(rvec_cam, tvec_cam)
         distance_m = float(sqrt(sum(raw_tag_tvec.flatten() ** 2)))
 
-        # Compute viewing angle: angle between tag normal and camera forward axis.
-        # Tag lies in its XY plane with +Z as normal. In camera coordinates, camera forward is +Z.
-        # Larger angle => more oblique ("steeper") view. We choose the maximum.
+        # Compute pitch angle magnitude (closer to 0 is better).
+        # Use the same pitch extraction method as transform_to_map_coordinates().
         R_tag, _ = cv2.Rodrigues(raw_tag_rvec)
-        tag_normal_cam = R_tag[:, 2]  # tag +Z expressed in camera frame
-        cosang = float(tag_normal_cam[2]) / (float(np.linalg.norm(tag_normal_cam)) + 1e-9)
-        cosang = max(-1.0, min(1.0, cosang))
-        view_angle_deg = float(degrees(math.acos(abs(cosang))))
+        pitch_rad = -atan2(R_tag[2, 0], sqrt(R_tag[2, 1] ** 2 + R_tag[2, 2] ** 2))
+        pitch_deg = float(degrees(pitch_rad))
+        pitch_abs_deg = abs(pitch_deg)
 
         tag_rvec, tag_tvec = raw_tag_rvec, raw_tag_tvec
         if pose_adjust_fn is not None:
             tag_rvec, tag_tvec = pose_adjust_fn(raw_tag_rvec, raw_tag_tvec)
 
-        if best is None or view_angle_deg > best["view_angle_deg"]:
+        if best is None or pitch_abs_deg < best["pitch_abs_deg"]:
             best = {
                 "tag_id": int(tag_id_int),
                 "distance_m": distance_m,
-                "view_angle_deg": view_angle_deg,
+                "pitch_deg": pitch_deg,
+                "pitch_abs_deg": pitch_abs_deg,
                 "raw_tag_rvec": raw_tag_rvec,
                 "raw_tag_tvec": raw_tag_tvec,
                 "tag_rvec": tag_rvec,
@@ -1091,13 +1090,13 @@ def main():
                 pose_adjust_fn=None,
             )
 
-            # Choose the "steepest angle" tag across both cameras (most oblique view).
+            # Choose the tag with the lowest |pitch| across both cameras (closer to 0 is better).
             chosen = None
             chosen_cam = None  # 'front' or 'back'
             if best_front is not None:
                 chosen = best_front
                 chosen_cam = "front"
-            if best_back is not None and (chosen is None or best_back["view_angle_deg"] > chosen["view_angle_deg"]):
+            if best_back is not None and (chosen is None or best_back["pitch_abs_deg"] < chosen["pitch_abs_deg"]):
                 chosen = best_back
                 chosen_cam = "back"
 
@@ -1253,8 +1252,8 @@ def main():
             if chosen is not None:
                 print("\r" + " "*120, end="")  # Clear line
                 print(
-                    f"\rUsing {chosen_cam} cam | steepest-angle tag ID {chosen['tag_id']} @ anchor {TAG_MAP_POSITIONS_CM[chosen['tag_id']]} "
-                    f"| ViewAngle: {chosen.get('view_angle_deg', 0.0):.1f} deg | Distance: {chosen['distance_m']*100:.2f} cm",
+                    f"\rUsing {chosen_cam} cam | min-|pitch| tag ID {chosen['tag_id']} @ anchor {TAG_MAP_POSITIONS_CM[chosen['tag_id']]} "
+                    f"| Pitch: {chosen.get('pitch_deg', 0.0):.1f} deg | Distance: {chosen['distance_m']*100:.2f} cm",
                     end=""
                 )
             
