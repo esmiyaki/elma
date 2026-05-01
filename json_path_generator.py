@@ -15,6 +15,8 @@ except Exception:
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
+from apriltag_pose import get_latest_map_pose
+
 
 MAP_SIZE = 200.0  # cm
 
@@ -128,6 +130,7 @@ class PathGeneratorUI:
         self.step_cm = 2.0
         self.current_direction = 1
         self.control_points: List[ControlPoint] = []
+        self.start_pose: Optional[Tuple[float, float, float]] = None  # (x,y,yaw) in std rad
 
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
         self.fig.canvas.manager.set_window_title("JSON Path Generator (test)")
@@ -171,7 +174,12 @@ class PathGeneratorUI:
         # Drawing artists
         (self.cp_line,) = self.ax.plot([], [], "k--", lw=1.5, alpha=0.6, label="control polyline")
         (self.path_line,) = self.ax.plot([], [], "b-", lw=2.0, alpha=0.8, label="resampled path")
+        (self.car_dot,) = self.ax.plot([], [], "go", ms=8, label="car start")
+        (self.car_arrow,) = self.ax.plot([], [], "g-", lw=2)
         self.ax.legend(loc="upper right")
+
+        # Initialize start pose from AprilTag
+        self._set_start_from_apriltag()
 
         self._set_dir(self.current_direction)
         self._update_plot()
@@ -204,8 +212,34 @@ class PathGeneratorUI:
         self._update_plot()
 
     def _clear(self, event=None):
-        self.control_points = []
+        # Keep the start point (index 0) if it exists
+        if self.start_pose is not None:
+            x, y, _ = self.start_pose
+            self.control_points = [ControlPoint(x=x, y=y, direction=self.current_direction)]
+        else:
+            self.control_points = []
         self._update_plot()
+
+    def _set_start_from_apriltag(self):
+        """
+        Reads a single pose from apriltag_pose and sets it as the first control point.
+        yaw conversion matches pathcreation:
+          apriltag yaw: 0°=+Y, CCW+
+          planner yaw:  0 rad=+X, CCW+   => yaw_rad = deg2rad(yaw_deg) + pi/2
+        """
+        p = get_latest_map_pose(timeout_s=8.0, target_fps=10.0)
+        if p is None:
+            print("[X] No AprilTag detected. Start pose not set.")
+            return
+        x = float(p["x_cm"])
+        y = float(p["y_cm"])
+        yaw = normalize_angle(math.radians(float(p["yaw_deg"])) + (math.pi / 2.0))
+        self.start_pose = (x, y, yaw)
+        # Set/overwrite first control point as start
+        if self.control_points:
+            self.control_points[0] = ControlPoint(x=x, y=y, direction=self.current_direction)
+        else:
+            self.control_points.append(ControlPoint(x=x, y=y, direction=self.current_direction))
 
     def _on_click(self, event):
         if event.inaxes != self.ax:
@@ -235,6 +269,16 @@ class PathGeneratorUI:
         ys = [p[1] for p in path]
         self.path_line.set_data(xs, ys)
 
+        # Draw car start pose as dot + arrow
+        if self.start_pose is not None:
+            sx, sy, syaw = self.start_pose
+            self.car_dot.set_data([sx], [sy])
+            L = 12.0
+            self.car_arrow.set_data([sx, sx + L * math.cos(syaw)], [sy, sy + L * math.sin(syaw)])
+        else:
+            self.car_dot.set_data([], [])
+            self.car_arrow.set_data([], [])
+
         self.info.set_text(
             f"gear={'FWD' if self.current_direction>0 else 'REV'} | step={self.step_cm:.2f}cm\n"
             f"control_points={len(self.control_points)} | json_points={len(path)}"
@@ -247,7 +291,11 @@ class PathGeneratorUI:
             print("[X] Need at least 2 points.")
             return
 
-        start_pose = (path[0][0], path[0][1], path[0][2])
+        # Use AprilTag start pose for JSON start if available
+        if self.start_pose is not None:
+            start_pose = self.start_pose
+        else:
+            start_pose = (path[0][0], path[0][1], path[0][2])
         target_pose = (path[-1][0], path[-1][1], path[-1][2])
 
         data = {
