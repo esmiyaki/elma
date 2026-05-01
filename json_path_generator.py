@@ -205,7 +205,13 @@ class PathGeneratorUI:
         self.current_direction = 1 if d >= 0 else -1
         self.btn_fwd.color = "#e0e0e0" if self.current_direction > 0 else "white"
         self.btn_rev.color = "#e0e0e0" if self.current_direction < 0 else "white"
+        # Direction is stored on the START of the next segment (the last control point).
+        # When switching gear, apply it to the last control point so the next drawn segment
+        # uses the selected direction.
+        if self.control_points:
+            self.control_points[-1].direction = self.current_direction
         self.fig.canvas.draw_idle()
+        self._update_plot()
 
     def _change_step(self, delta: float):
         self.step_cm = max(0.5, round(self.step_cm + delta, 2))
@@ -240,6 +246,8 @@ class PathGeneratorUI:
             self.control_points[0] = ControlPoint(x=x, y=y, direction=self.current_direction)
         else:
             self.control_points.append(ControlPoint(x=x, y=y, direction=self.current_direction))
+        # Ensure start point direction matches current gear for the first segment.
+        self.control_points[-1].direction = self.current_direction
 
     def _on_click(self, event):
         if event.inaxes != self.ax:
@@ -256,6 +264,9 @@ class PathGeneratorUI:
         y = float(event.ydata)
         if not (0.0 <= x <= MAP_SIZE and 0.0 <= y <= MAP_SIZE):
             return
+        # Segment direction is stored on the previous point. Make sure it matches current gear.
+        if self.control_points:
+            self.control_points[-1].direction = self.current_direction
         self.control_points.append(ControlPoint(x=x, y=y, direction=self.current_direction))
         self._update_plot()
 
