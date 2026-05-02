@@ -62,7 +62,7 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     return best_i
 
 
-def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=0.4, softening_fwd=30.0, softening_rev=50.0):
+def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=30.0, softening_rev=50.0):
     """
     Front-Axle Stanley with Planner Feedforward and True Kinematic Reverse.
     """
@@ -110,7 +110,7 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=0.4, softening_fwd=
     v = 20.0  # Nominal speed
     cte_term = math.atan2(k * cte * cte_direction, (v + softening))
 
-    steer = steer_ff + heading_err - cte_term
+    steer = - steer_ff + heading_err - cte_term
     steer = wrap_pi(steer)
     
     return steer, int(idx), direction
