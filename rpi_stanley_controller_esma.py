@@ -62,9 +62,10 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     return best_i
 
 
-def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
+def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=0.4, softening_fwd=30.0, softening_rev=50.0):
     """
-    Front-Axle Anchored Stanley with Planner Feedforward.
+    Front-Axle Anchored Stanley with Planner Feedforward and Gain Scheduling.
+    Uses gentler parameters in reverse to prevent S-shape oscillations.
     """
     n = len(points)
     idx = clamp(idx_near, 0, n - 1)
@@ -75,14 +76,13 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     tyaw = float(p["yaw_rad"])
     direction = int(p.get("direction", 1))
     
-    # Extract the perfect kinematic steering angle calculated by the planner
     steer_ff = float(p.get("steer_rad", 0.0))
 
     x = float(pose["x_cm"])
     y = float(pose["y_cm"])
     yaw = float(pose["yaw_rad"])
 
-    # 1. Heading Flip Trick (Fools the controller into reversing smoothly on a front-axle path)
+    # 1. Heading Flip Trick
     yaw_eff = wrap_pi(yaw + (math.pi if direction < 0 else 0.0))
     heading_err = wrap_pi(tyaw - yaw_eff)
 
@@ -94,15 +94,23 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     left_ny = math.cos(tyaw_eff)
     cte = dx * left_nx + dy * left_ny  # +: vehicle is left of path
 
-    # 3. Control Law with Feedforward
+    # 3. Apply Gear-Specific Parameters
+    if direction >= 0:
+        k = k_fwd
+        softening = softening_fwd
+    else:
+        k = k_rev
+        softening = softening_rev
+
+    # 4. Control Law
     v = 20.0  # Nominal speed
     cte_term = math.atan2(k * cte, (v + softening))
 
-    # We add the feedforward term so the servo anticipates the curve.
     steer = steer_ff - heading_err + cte_term
     steer = wrap_pi(steer)
     
     return steer, int(idx), direction
+
 
 def maybe_init_viz():
     """
