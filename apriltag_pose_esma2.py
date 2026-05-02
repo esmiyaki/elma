@@ -170,31 +170,33 @@ def draw_tag_axes(image, camera_matrix, dist_coeffs, rvec, tvec, tag_size):
 
 def rotation_vector_to_euler(rvec):
     """
-    Convert rotation vector to Euler angles (roll, pitch, yaw).
-    
+    Convert rotation vector to Euler angles (roll, pitch, yaw) using ZYX convention.
+
     Args:
         rvec: Rotation vector (3x1)
-    
+
     Returns:
         (roll, pitch, yaw) in degrees
+        - roll  : rotation around camera Z (in-plane)
+        - pitch : rotation around camera Y (elevation / tilt); range ±90°
+        - yaw   : rotation around camera X (heading); full ±180° range
     """
-    # Convert rotation vector to rotation matrix
     R, _ = cv2.Rodrigues(rvec)
-    
-    # Extract Euler angles (ZYX convention)
-    sy = sqrt(R[0, 0]**2 + R[1, 0]**2)
-    
+
+    # Cosine of the pitch angle; used to detect gimbal-lock singularity.
+    sy = sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
     singular = sy < 1e-6
-    
+
     if not singular:
-        roll     = atan2(R[2, 1], R[2, 2])
-        pitch    = atan2(-R[2, 0], sy)
-        heading  = atan2(R[1, 0], R[0, 0])
+        roll  = atan2(R[2, 1], R[2, 2])
+        pitch = atan2(-R[2, 0], sy)        # Limited to ±90° by convention
+        yaw   = atan2(R[1, 0], R[0, 0])   # Full ±180°
     else:
-        roll = atan2(-R[1, 2], R[1, 1])
+        # Gimbal-lock fallback: pitch ≈ ±90°, yaw is indeterminate.
+        roll  = atan2(-R[1, 2], R[1, 1])
         pitch = atan2(-R[2, 0], sy)
-        yaw = 0
-    
+        yaw   = 0.0
+
     return degrees(roll), degrees(pitch), degrees(yaw)
 
 
@@ -508,12 +510,44 @@ def draw_pose_info(img, pose_data, start_x=10, start_y=30):
 
 
 def transform_to_map_coordinates(tvec, rvec, tag_id, tag_map_xy_cm=(100, 200)):
-    x_tag, y_tag, z_tag = tvec.flatten() * 100
+    """
+    Transform tag position to map coordinate system (FRONT camera).
+
+    Extracts the horizontal heading angle by projecting the camera's look
+    direction onto the tag's XZ plane via atan2(R[2,0], R[2,2]).
+    Using R[2,2] directly (instead of sqrt(R[2,1]²+R[2,2]²)) lets atan2
+    receive a potentially-negative second argument, giving the full ±180°
+    range instead of the ±90° range produced by the old sqrt formula.
+
+    Map coordinate system:
+    - Origin at bottom-left (0, 0)
+    - 200x200 cm area
+    - 0 degrees = facing north (top wall)
+    - Angle increases clockwise
+
+    Transformation varies by tag ID:
+    - Tag 0: x_map = tag_map_x + x_tag, y_map = tag_map_y - z_tag
+    - Tag 1 & 2: x_map = tag_map_x - z_tag, y_map = tag_map_y - x_tag
+    - Tag 3: x_map = tag_map_x - x_tag, y_map = tag_map_y + z_tag
+    - Tag 4 & 5: x_map = tag_map_x + z_tag, y_map = tag_map_y + x_tag
+
+    Args:
+        tvec: Translation vector (tag position relative to camera) in meters
+        rvec: Rotation vector (tag rotation relative to camera)
+        tag_id: Tag ID (0-5) to determine transformation
+        tag_map_xy_cm: Tag's anchor position in map coordinates (cm)
+
+    Returns:
+        (x_map, y_map, yaw_map): Car position in map coordinates (cm, cm, degrees)
+    """
+    x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
 
     tag_map_x, tag_map_y = tag_map_xy_cm
     R_tag, _ = cv2.Rodrigues(rvec)
 
-    # FIX: use R_tag[2, 2] instead of sqrt(...) to allow full ±180° range
+    # FIX: use R_tag[2, 2] instead of sqrt(R_tag[2,1]**2 + R_tag[2,2]**2).
+    # sqrt() is always non-negative, clamping atan2 output to ±90°.
+    # R_tag[2, 2] can be negative, giving the full ±180° range.
     pitch_rad = -atan2(R_tag[2, 0], R_tag[2, 2])
 
     if tag_id == 0:
@@ -545,8 +579,10 @@ def transform_to_map_coordinates(tvec, rvec, tag_id, tag_map_xy_cm=(100, 200)):
     else:
         yaw_map = pitch_deg
 
-    return x_map, y_map, yaw_map
+    # Normalise to [0, 360) so callers always receive a consistent range.
+    yaw_map = normalize_angle_deg_0_360(yaw_map)
 
+    return x_map, y_map, yaw_map
 
 
 def normalize_angle_deg_0_360(angle_deg):
@@ -557,12 +593,27 @@ def normalize_angle_deg_0_360(angle_deg):
 
 
 def transform_to_map_coordinates_back_camera(tvec, rvec, tag_id, tag_map_xy_cm=(100, 200)):
-    x_tag, y_tag, z_tag = tvec.flatten() * 100
+    """
+    Transform tag position to map coordinates when the pose comes from the BACK camera.
+
+    Same atan2 fix as the front-camera version: R_tag[2, 2] replaces sqrt(...)
+    to enable the full ±180° heading range.
+
+    Args:
+        tvec: Translation vector (tag position relative to BACK camera) in meters
+        rvec: Rotation vector (tag rotation relative to BACK camera)
+        tag_id: Tag ID (0-5) to determine transformation
+        tag_map_xy_cm: Tag's anchor position in map coordinates (cm)
+
+    Returns:
+        (x_map, y_map, yaw_map): Car position in map coordinates (cm, cm, degrees)
+    """
+    x_tag, y_tag, z_tag = tvec.flatten() * 100  # Convert to cm
 
     tag_map_x, tag_map_y = tag_map_xy_cm
     R_tag, _ = cv2.Rodrigues(rvec)
 
-    # FIX: same correction as front camera
+    # FIX: same correction as front camera — R_tag[2, 2] instead of sqrt(...)
     pitch_rad = -atan2(R_tag[2, 0], R_tag[2, 2])
 
     if tag_id == 0:
@@ -583,6 +634,8 @@ def transform_to_map_coordinates_back_camera(tvec, rvec, tag_id, tag_map_xy_cm=(
 
     pitch_deg = degrees(pitch_rad)
 
+    # Back camera needs an additional 180° offset on every tag's yaw,
+    # because the camera faces the opposite direction to the front camera.
     if tag_id == 0:
         yaw_map = -pitch_deg + 180
     elif tag_id in [1, 2]:
@@ -595,7 +648,10 @@ def transform_to_map_coordinates_back_camera(tvec, rvec, tag_id, tag_map_xy_cm=(
         yaw_map = -pitch_deg + 180
 
     yaw_map = normalize_angle_deg_0_360(yaw_map)
+
     return x_map, y_map, yaw_map
+
+
 def create_map_visualization(x_map, y_map, yaw_map):
     """
     Create a visualization of the map with car position.
@@ -1003,7 +1059,7 @@ def main():
             frame_front = picam2_front.capture_array()
             frame_back = picam2_back.capture_array()
 
-            # Process each frame independently. For the back camera, flip pose into front/vehicle frame.
+            # Process each frame independently.
             display_front, tag_found_front, best_front = find_best_tag_in_frame(
                 frame_front,
                 detector,
@@ -1023,7 +1079,7 @@ def main():
                 pose_adjust_fn=None,
             )
 
-            # Choose the closest tag across both cameras (distance is based on the raw pose).
+            # Choose the closest tag across both cameras.
             chosen = None
             chosen_cam = None  # 'front' or 'back'
             if best_front is not None:
@@ -1055,7 +1111,6 @@ def main():
                 alpha=0.6,
             )
 
-            # If we have at least one valid tag, use the closest one for pose + map.
             if chosen is not None:
                 display_frame = display_front if chosen_cam == "front" else display_back
 
@@ -1069,10 +1124,8 @@ def main():
                     TAG_SIZE
                 )
 
-                # Get pose information (tag pose relative to vehicle/front frame; back camera is flipped)
+                # Get pose information
                 pose_data = format_pose_info(chosen["tag_tvec"], chosen["tag_rvec"])
-
-                # Display pose info on image with readable formatting
                 draw_pose_info(display_frame, pose_data)
 
                 # Transform to map coordinates using this tag's known anchor point
@@ -1096,7 +1149,7 @@ def main():
                 map_img = create_map_visualization(x_map, y_map, yaw_map)
                 cv2.imshow("Map - Car Position", map_img)
             else:
-                # Show empty map without car representation when tag not detected by either camera
+                # Show empty map without car representation when no tag detected
                 map_img_empty = np.ones((MAP_SIZE * 2, MAP_SIZE * 2, 3), dtype=np.uint8) * 240
                 grid_spacing = 50
                 for i in range(0, MAP_SIZE + 1, grid_spacing):
@@ -1211,7 +1264,6 @@ def main():
         picam2_front.stop()
         picam2_back.stop()
         cv2.destroyAllWindows()
-        # Close both windows
         try:
             cv2.destroyWindow("AprilTag - FRONT (Press 'q' to quit)")
             cv2.destroyWindow("AprilTag - BACK (Press 'q' to quit)")
@@ -1221,7 +1273,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # Allow tag size to be specified via command line or environment variable
     import sys
     if len(sys.argv) > 1:
         try:
