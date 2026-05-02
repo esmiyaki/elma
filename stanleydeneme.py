@@ -78,6 +78,10 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=80, direction=None):
     return best_i
 
 
+# Distance from localization reference to rear axle along -body_forward (WB ≈ CAR_L * 0.75).
+CTE_REAR_AXLE_CM = 18.75
+
+
 def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     """
     Stanley controller in map frame.
@@ -88,10 +92,11 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     Path points store vehicle *body* yaw tyaw for both forward and reverse segments.
     direction == -1 means gear reverse (velocity opposite to body forward).
 
-    Heading error must compare body headings: wrap_pi(tyaw - yaw). Using tyaw - (yaw+pi)
-    for reverse was wrong (off by pi) and saturated steering on straights.
+    Cross-track on reverse uses the rear-axle point:
+      x_ra = x - CTE_REAR_AXLE_CM * cos(yaw), y_ra = y - CTE_REAR_AXLE_CM * sin(yaw)
 
-    Cross-track uses the left normal of the *motion* tangent (tyaw + pi when reversing).
+    Heading error uses motion-aligned yaws (add pi for reverse). Cross-track uses the
+    left normal of the path motion tangent.
 
     Returns:
       (steer_cmd_rad, target_idx, direction)
@@ -120,8 +125,15 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
 
     # Heading error in motion frame (this reduces to wrap_pi(tyaw - yaw) for both gears).
     heading_err = wrap_pi(tyaw_motion - yaw_motion)
-    dx = x - tx
-    dy = y - ty
+
+    # Reverse: measure CTE at rear axle (stable for backing); forward: pose reference.
+    if direction < 0:
+        x_cte = x - CTE_REAR_AXLE_CM * math.cos(yaw)
+        y_cte = y - CTE_REAR_AXLE_CM * math.sin(yaw)
+    else:
+        x_cte, y_cte = x, y
+    dx = x_cte - tx
+    dy = y_cte - ty
     left_nx = -math.sin(tyaw_motion)
     left_ny = math.cos(tyaw_motion)
     cte = dx * left_nx + dy * left_ny  # +: vehicle is left of path (w.r.t. motion)
