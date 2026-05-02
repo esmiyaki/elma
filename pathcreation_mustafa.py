@@ -34,8 +34,8 @@ MAP_SIZE = 200
 SAFE_MARGIN = 2.0
 
 # 2. Target Tolerance Settings (AYARLANABİLİR TOLERANSLAR)
-FINAL_XY_TOLERANCE = 1
-FINAL_YAW_TOLERANCE = np.deg2rad(5.0)
+FINAL_XY_TOLERANCE = 5.0
+FINAL_YAW_TOLERANCE = np.deg2rad(10.0)
 
 # Car Specs
 CAR_L, CAR_W = 25.0, 18.0
@@ -92,7 +92,82 @@ def add_exit_btn(fig):
     return btn
 
 
+def _filter_short_gear_islands_for_json(
+        path: list[tuple[float, float, float, int, float]],
+        *,
+        min_island_len_cm: float = 5.0,
+) -> list[tuple[float, float, float, int, float]]:
+    """
+    JSON-export-only filter.
+
+    Removes tiny direction islands (length < min_island_len_cm) that are
+    *sandwiched* by the opposite direction, e.g.:
+      backward ... forward (3cm) ... backward
+
+    This does NOT change planning/animation; only the exported points list.
+    """
+    if len(path) < 3:
+        return path
+
+    def segment_length(i0: int, i1: int) -> float:
+        dist = 0.0
+        for i in range(i0 + 1, i1 + 1):
+            x0, y0 = path[i - 1][0], path[i - 1][1]
+            x1, y1 = path[i][0], path[i][1]
+            dist += float(np.hypot(x1 - x0, y1 - y0))
+        return dist
+
+    changed = True
+    keep = path
+    while changed:
+        changed = False
+        if len(keep) < 3:
+            break
+
+        # Build contiguous direction runs as (start_idx, end_idx, direction)
+        runs: list[tuple[int, int, int]] = []
+        run_start = 0
+        run_dir = int(keep[0][3])
+        for i in range(1, len(keep)):
+            d = int(keep[i][3])
+            if d != run_dir:
+                runs.append((run_start, i - 1, run_dir))
+                run_start = i
+                run_dir = d
+        runs.append((run_start, len(keep) - 1, run_dir))
+
+        # Remove any short middle run where prev_dir == next_dir != this_dir
+        remove_ranges: list[tuple[int, int]] = []
+        for r in range(1, len(runs) - 1):
+            s0, e0, d0 = runs[r - 1]
+            s1, e1, d1 = runs[r]
+            s2, e2, d2 = runs[r + 1]
+            if d0 == d2 and d1 != d0:
+                island_len = 0.0
+                for i in range(s1 + 1, e1 + 1):
+                    x0, y0 = keep[i - 1][0], keep[i - 1][1]
+                    x1, y1 = keep[i][0], keep[i][1]
+                    island_len += float(np.hypot(x1 - x0, y1 - y0))
+                if island_len < min_island_len_cm:
+                    remove_ranges.append((s1, e1))
+
+        if not remove_ranges:
+            break
+
+        # Apply removals from the end to keep indices valid.
+        out = list(keep)
+        for s, e in sorted(remove_ranges, reverse=True):
+            # Drop the island points; keep continuity by retaining the last
+            # point before island and first point after island.
+            del out[s: e + 1]
+        keep = out
+        changed = True
+
+    return keep
+
+
 def save_path_json(path, start_pose, target_slot_id, target_pose, filename="planned_path.json"):
+    path = _filter_short_gear_islands_for_json(path, min_island_len_cm=5.0)
     points = [
         {
             "x_cm": float(x),
@@ -273,121 +348,75 @@ class MapSelector:
             self.btn.label.set_text("SELECTING...")
 
 
-class DirectionAndPoseSelector:
-    def __init__(self, slots, occupied, custom_obs, target_id):
+class ParkingModeSelector:
+    """
+    After obstacle / slot setup: user only chooses forward vs reverse parking.
+    Start pose comes from april tag (same convention as pathcreation.py).
+    """
+    def __init__(self):
         self.is_reverse_park = True
-        self.start_pose, self.done = None, False
-        self.target_slot = next(s for s in slots if s['id'] == target_id)
-
-        self.fig, self.ax = plt.subplots(figsize=(8, 9))
-        self.fig.canvas.manager.set_window_title('Stage 3: Pose')
-        plt.subplots_adjust(bottom=0.20)
+        self.done = False
+        self.fig, self.ax = plt.subplots(figsize=(6, 3))
+        self.fig.canvas.manager.set_window_title("Parking mode")
+        plt.subplots_adjust(bottom=0.35)
+        self.ax.axis("off")
+        self.ax.text(
+            0.5, 0.75, "Parking direction (start pose = AprilTag)\nReverse = back into slot, Forward = nose in",
+            ha="center",
+            va="center",
+            transform=self.ax.transAxes,
+            fontsize=11,
+            wrap=True,
+        )
         self.exit_btn = add_exit_btn(self.fig)
-        self.setup_plot()
-        self.ax.set_title("STAGE 4: Position Car (Drag to Orient)\nRed Arrow = Front of Car", fontsize=10)
 
-        self.obs_list = make_wall_obstacles(MAP_SIZE)
-        for o in custom_obs: self.obs_list.append(
-            translate(rotate(box(-5, -5, 5, 5), o[2], use_radians=True), o[0], o[1]))
-        for s in slots:
-            p = translate(rotate(box(-SLOT_D / 2, -SLOT_W / 2, SLOT_D / 2, SLOT_W / 2), s['yaw'], use_radians=True),
-                          s['cx'], s['cy'])
-            if s['id'] == target_id:
-                self.ax.fill(*p.exterior.xy, color='#66ff66', alpha=0.4)
-            elif s['id'] in occupied:
-                self.obs_list.append(p); self.ax.fill(*p.exterior.xy, color='#ff6666', alpha=0.4)
-            else:
-                self.ax.plot(*p.exterior.xy, color='#333333', linestyle=':')
-        for o in self.obs_list:
-            if isinstance(o, Polygon): self.ax.fill(*o.exterior.xy, color='#333333')
+        ax_rev = plt.axes([0.12, 0.12, 0.26, 0.18])
+        ax_fwd = plt.axes([0.40, 0.12, 0.26, 0.18])
+        ax_ok = plt.axes([0.68, 0.12, 0.26, 0.18])
+        self.btn_rev = Button(ax_rev, "Reverse park", color="lightblue")
+        self.btn_fwd = Button(ax_fwd, "Forward park", color="white")
+        self.btn_ok = Button(ax_ok, "Continue", color="#90EE90")
+        self.btn_rev.on_clicked(self._rev)
+        self.btn_fwd.on_clicked(self._fwd)
+        self.btn_ok.on_clicked(self._ok)
+        self._refresh_highlight()
 
-        ax_rev = plt.axes([0.15, 0.05, 0.3, 0.07]);
-        ax_fwd = plt.axes([0.55, 0.05, 0.3, 0.07])
-        self.btn_rev = Button(ax_rev, 'Reverse', color='lightblue');
-        self.btn_fwd = Button(ax_fwd, 'Forward', color='white')
-        self.btn_rev.on_clicked(self.set_reverse);
-        self.btn_fwd.on_clicked(self.set_forward)
+    def _refresh_highlight(self):
+        self.btn_rev.color = "lightblue" if self.is_reverse_park else "white"
+        self.btn_fwd.color = "white" if self.is_reverse_park else "lightblue"
+        self.fig.canvas.draw_idle()
 
-        self.start_point = None;
-        self.point, = self.ax.plot([], [], 'b.', ms=10)
-        self.ghost_patch, self.ghost_arrow, self.car_preview_patch, self.car_preview_arrow = None, None, None, None
+    def _rev(self, event):
+        self.is_reverse_park = True
+        self._refresh_highlight()
 
-        self.info_box = self.ax.text(0.02, 0.98, "Select Start Position...", transform=self.ax.transAxes,
-                                     fontsize=10, verticalalignment='top',
-                                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
-        self.collision_text = self.ax.text(MAP_SIZE / 2, MAP_SIZE - 20, "", ha='center', color='red', fontsize=12,
-                                           fontweight='bold')
-        self.update_ghost_car()
-        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-        self.fig.canvas.mpl_connect('motion_notify_event', self.on_move)
+    def _fwd(self, event):
+        self.is_reverse_park = False
+        self._refresh_highlight()
 
-    def setup_plot(self):
-        self.ax.set_xlim(0, MAP_SIZE);
-        self.ax.set_ylim(0, MAP_SIZE);
-        self.ax.set_aspect('equal');
-        self.ax.grid(True, linestyle=':', alpha=0.6)
+    def _ok(self, event):
+        self.done = True
+        plt.close(self.fig)
 
-    def get_target_yaw(self):
-        return self.target_slot['yaw'] if self.is_reverse_park else normalize_angle(self.target_slot['yaw'] + np.pi)
 
-    def update_ghost_car(self):
-        if self.ghost_patch: self.ghost_patch.remove(); self.ghost_patch = None
-        if self.ghost_arrow: self.ghost_arrow.remove(); self.ghost_arrow = None
-        yaw = self.get_target_yaw()
-        cx, cy = self.target_slot['cx'], self.target_slot['cy']
-        poly = get_car_polygon(cx, cy, yaw)
-        self.ghost_patch = patches.Polygon(np.array(poly.exterior.coords), fc='none', ec='black', lw=2, linestyle='--',
-                                           alpha=0.7)
-        self.ax.add_patch(self.ghost_patch)
-        arrow_len = CAR_L / 2
-        self.ghost_arrow = self.ax.arrow(cx, cy, arrow_len * np.cos(yaw), arrow_len * np.sin(yaw), head_width=4,
-                                         head_length=4, fc='black', ec='black', alpha=0.7)
-        self.fig.canvas.draw()
-
-    def set_reverse(self, event):
-        self.is_reverse_park = True; self.btn_rev.color = 'lightblue'; self.btn_fwd.color = 'white'; self.update_ghost_car()
-
-    def set_forward(self, event):
-        self.is_reverse_park = False; self.btn_fwd.color = 'lightblue'; self.btn_rev.color = 'white'; self.update_ghost_car()
-
-    def on_click(self, event):
-        if event.inaxes != self.ax: return
-        if self.start_point is None:
-            self.start_point = (event.xdata, event.ydata)
-            self.point.set_data([event.xdata], [event.ydata])
-            self.collision_text.set_text("Drag to set orientation...")
-            self.info_box.set_text("Position selected. Drag for Angle.")
-            self.fig.canvas.draw()
-        else:
-            yaw = math.atan2(event.ydata - self.start_point[1], event.xdata - self.start_point[0])
-            poly = get_car_polygon(self.start_point[0], self.start_point[1], yaw, padding=0.0)
-            if any(poly.intersects(obs) for obs in self.obs_list):
-                self.collision_text.set_text("[!] COLLISION! Select new position.")
-                self.start_point = None;
-                self.point.set_data([], [])
-                if self.car_preview_patch: self.car_preview_patch.remove(); self.car_preview_patch = None
-                if self.car_preview_arrow: self.car_preview_arrow.remove(); self.car_preview_arrow = None
-                self.fig.canvas.draw()
-            else:
-                self.start_pose = (self.start_point[0], self.start_point[1], yaw)
-                self.done = True;
-                plt.close(self.fig)
-
-    def on_move(self, event):
-        if self.start_point is None or event.inaxes != self.ax: return
-        yaw = math.atan2(event.ydata - self.start_point[1], event.xdata - self.start_point[0])
-        self.info_box.set_text(
-            f"Pos: ({self.start_point[0]:.1f}, {self.start_point[1]:.1f})\nAngle: {np.rad2deg(normalize_angle(yaw)):.1f}°")
-        if self.car_preview_patch: self.car_preview_patch.remove(); self.car_preview_patch = None
-        if self.car_preview_arrow: self.car_preview_arrow.remove(); self.car_preview_arrow = None
-        poly = get_car_polygon(self.start_point[0], self.start_point[1], yaw)
-        self.car_preview_patch = patches.Polygon(np.array(poly.exterior.coords), fc='cyan', ec='black', alpha=0.6)
-        self.ax.add_patch(self.car_preview_patch)
-        arrow_len = CAR_L / 2
-        self.car_preview_arrow = self.ax.arrow(self.start_point[0], self.start_point[1], arrow_len * np.cos(yaw),
-                                               arrow_len * np.sin(yaw), head_width=3, head_length=3, fc='red', ec='red',
-                                               zorder=10)
-        self.fig.canvas.draw()
+def get_start_pose_from_apriltag(*, timeout_s=8.0, target_fps=10.0):
+    """
+    Map frame (cm) + planner yaw_rad, aligned with pathcreation.py / apriltag_pose:
+    planner yaw (+X forward, CCW+) = deg2rad(yaw_deg) + pi/2
+    """
+    try:
+        from apriltag_pose import get_latest_map_pose
+    except ImportError:
+        messagebox.showerror("AprilTag", "apriltag_pose module not available.")
+        return None
+    pose = get_latest_map_pose(timeout_s=timeout_s, target_fps=target_fps)
+    if pose is None:
+        return None
+    x_cm = float(pose["x_cm"])
+    y_cm = float(pose["y_cm"])
+    yaw_deg = float(pose["yaw_deg"])
+    yaw_rad = normalize_angle(np.deg2rad(yaw_deg) + np.pi / 2.0)
+    return (x_cm, y_cm, yaw_rad)
 
 
 def create_slots():
@@ -421,11 +450,59 @@ def run_simulation():
     plt.show()
     sel = MapSelector(slots, ed.custom_obstacles);
     plt.show()
-    if not sel.done or sel.target_id is None: return
-    dp_sel = DirectionAndPoseSelector(slots, sel.occupied_ids, ed.custom_obstacles, sel.target_id);
+    if not sel.done or sel.target_id is None:
+        return
+
+    mode_sel = ParkingModeSelector()
     plt.show()
-    if not dp_sel.done: return
-    plt.close('all')
+    if not mode_sel.done:
+        return
+    plt.close("all")
+
+    start_pose = get_start_pose_from_apriltag()
+    if start_pose is None:
+        messagebox.showerror(
+            "AprilTag",
+            "Could not read latest map pose. Run apriltag_pose with a locked tag pose first.",
+        )
+        return
+
+    sx, sy, syaw = start_pose
+    car_at_start = get_car_polygon(sx, sy, syaw)
+    preview_obs_list = list(make_wall_obstacles(MAP_SIZE))
+    for o in ed.custom_obstacles:
+        preview_obs_list.append(
+            translate(rotate(box(-5, -5, 5, 5), o[2], use_radians=True), o[0], o[1]))
+    for s in slots:
+        if s["id"] in sel.occupied_ids:
+            p = translate(
+                rotate(box(-SLOT_D / 2, -SLOT_W / 2, SLOT_D / 2, SLOT_W / 2), s["yaw"], use_radians=True),
+                s["cx"],
+                s["cy"],
+            )
+            preview_obs_list.append(p)
+
+    collision = False
+    for obs in preview_obs_list:
+        if isinstance(obs, Polygon) and obs.intersects(car_at_start):
+            collision = True
+            break
+
+    if collision:
+        messagebox.showerror(
+            "Start pose collision",
+            f"AprilTag start ({sx:.1f}, {sy:.1f}) overlaps an obstacle/slot obstacle.\n"
+            "Adjust the car or obstacle layout.",
+        )
+        print(f"[X] Start pose collides at ({sx:.1f}, {sy:.1f}) rad={syaw:.3f}")
+        return
+
+    print(
+        f"[*] Start from AprilTag: x={sx:.2f} y={sy:.2f} cm, "
+        f"yaw_deg(tag)={(np.rad2deg(syaw - np.pi / 2) % 360):.1f} → planner_yaw={np.rad2deg(syaw):.2f}°"
+    )
+
+    is_reverse_park = mode_sel.is_reverse_park
 
     obs_list = make_wall_obstacles(MAP_SIZE)
     for o in ed.custom_obstacles: obs_list.append(
@@ -438,8 +515,6 @@ def run_simulation():
                           s['cx'], s['cy'])
             obs_list.append(p)
 
-    start_pose = dp_sel.start_pose
-
     PARK_INSET_CM = 10.0
     wall_dx = -np.cos(target["yaw"])
     wall_dy = -np.sin(target["yaw"])
@@ -451,7 +526,7 @@ def run_simulation():
     yaw_reverse = target["yaw"]
     yaw_forward = normalize_angle(target["yaw"] + np.pi)
 
-    if dp_sel.is_reverse_park:
+    if is_reverse_park:
         primary_yaw, fallback_yaw = yaw_reverse, yaw_forward
         primary_x, primary_y = goal_out_x, goal_out_y
         fallback_x, fallback_y = goal_in_x, goal_in_y
