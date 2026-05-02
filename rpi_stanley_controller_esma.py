@@ -64,8 +64,7 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
 
 def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=0.4, softening_fwd=30.0, softening_rev=50.0):
     """
-    Front-Axle Anchored Stanley with Planner Feedforward and Gain Scheduling.
-    Uses gentler parameters in reverse to prevent S-shape oscillations.
+    Front-Axle Stanley with Planner Feedforward and True Kinematic Reverse.
     """
     n = len(points)
     idx = clamp(idx_near, 0, n - 1)
@@ -76,41 +75,45 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=0.4, softening_fwd=
     tyaw = float(p["yaw_rad"])
     direction = int(p.get("direction", 1))
     
+    # Perfect kinematic steering angle from the Hybrid A* planner
     steer_ff = float(p.get("steer_rad", 0.0))
 
     x = float(pose["x_cm"])
     y = float(pose["y_cm"])
     yaw = float(pose["yaw_rad"])
 
-    # 1. Heading Flip Trick
-    yaw_eff = wrap_pi(yaw + (math.pi if direction < 0 else 0.0))
-    heading_err = wrap_pi(tyaw - yaw_eff)
+    # 1. True Heading Error (Nose to Nose)
+    # We NO LONGER add pi. tyaw and yaw both represent the car's physical body orientation.
+    heading_err = wrap_pi(tyaw - yaw)
 
     # 2. Cross-Track Error
-    tyaw_eff = wrap_pi(tyaw + (math.pi if direction < 0 else 0.0))
+    # Normal is based on the target body orientation
     dx = x - tx
     dy = y - ty
-    left_nx = -math.sin(tyaw_eff)
-    left_ny = math.cos(tyaw_eff)
-    cte = dx * left_nx + dy * left_ny  # +: vehicle is left of path
+    left_nx = -math.sin(tyaw)
+    left_ny = math.cos(tyaw)
+    cte = dx * left_nx + dy * left_ny  # +: vehicle is physically to the left of the target line
 
-    # 3. Apply Gear-Specific Parameters
+    # 3. Apply Gear-Specific Parameters & Reverse Inversion
     if direction >= 0:
         k = k_fwd
         softening = softening_fwd
+        cte_direction = 1.0  # Normal steering correction
     else:
         k = k_rev
         softening = softening_rev
+        # In reverse, to move the rear of the car right, we must steer the front wheels left. 
+        # Inverting the CTE achieves this Kinematic flip cleanly.
+        cte_direction = -1.0
 
     # 4. Control Law
     v = 20.0  # Nominal speed
-    cte_term = math.atan2(k * cte, (v + softening))
+    cte_term = math.atan2(k * cte * cte_direction, (v + softening))
 
     steer = steer_ff - heading_err + cte_term
     steer = wrap_pi(steer)
     
     return steer, int(idx), direction
-
 
 def maybe_init_viz():
     """
