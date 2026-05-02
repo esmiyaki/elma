@@ -105,13 +105,12 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=
         # In reverse, to move the rear of the car right, we must steer the front wheels left. 
         # Inverting the CTE achieves this Kinematic flip cleanly.
         cte_direction = -1.0
-        steer_ff = - steer_ff
 
     # 4. Control Law
     v = 20.0  # Nominal speed
     cte_term = math.atan2(k * cte * cte_direction, (v + softening))
 
-    steer = - (- steer_ff + heading_err - cte_term)
+    steer = - steer_ff + heading_err - cte_term
     steer = wrap_pi(steer)
     
     return steer, int(idx), direction
