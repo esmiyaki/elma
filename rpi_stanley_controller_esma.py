@@ -62,11 +62,9 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     return best_i
 
 
-def stanley_control(points, pose, idx_near, k=1.2, softening=30.0, L=18.75):
+def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     """
-    Kinematic Reverse-Shift Stanley controller.
-    Calculates error from the front axle in forward gear, and rear axle in reverse.
-    Uses feedforward steering from the planner for smooth proactive cornering.
+    Front-Axle Anchored Stanley with Planner Feedforward.
     """
     n = len(points)
     idx = clamp(idx_near, 0, n - 1)
@@ -74,54 +72,37 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0, L=18.75):
 
     tx = float(p["x_cm"])
     ty = float(p["y_cm"])
-    tyaw = float(p["yaw_rad"])  # Target vehicle body orientation
+    tyaw = float(p["yaw_rad"])
     direction = int(p.get("direction", 1))
     
-    # Extract the feedforward steering angle calculated by the Hybrid A* planner
+    # Extract the perfect kinematic steering angle calculated by the planner
     steer_ff = float(p.get("steer_rad", 0.0))
 
-    # Anchor is the front axle (from AprilTag)
-    x_front = float(pose["x_cm"])
-    y_front = float(pose["y_cm"])
-    yaw = float(pose["yaw_rad"])  # Actual vehicle body orientation
+    x = float(pose["x_cm"])
+    y = float(pose["y_cm"])
+    yaw = float(pose["yaw_rad"])
 
-    # 1. Dynamic Axle Shift (Equation A1)
-    if direction >= 0:
-        # Forward: Control point remains exactly at the front axle
-        cx = x_front
-        cy = y_front
-    else:
-        # Reverse: Shift control point to the rear axle using the wheelbase (L)
-        cx = x_front - L * math.cos(yaw)
-        cy = y_front - L * math.sin(yaw)
+    # 1. Heading Flip Trick (Fools the controller into reversing smoothly on a front-axle path)
+    yaw_eff = wrap_pi(yaw + (math.pi if direction < 0 else 0.0))
+    heading_err = wrap_pi(tyaw - yaw_eff)
 
-    # 2. Heading Error
-    heading_err = wrap_pi(tyaw - yaw)
+    # 2. Cross-Track Error
+    tyaw_eff = wrap_pi(tyaw + (math.pi if direction < 0 else 0.0))
+    dx = x - tx
+    dy = y - ty
+    left_nx = -math.sin(tyaw_eff)
+    left_ny = math.cos(tyaw_eff)
+    cte = dx * left_nx + dy * left_ny  # +: vehicle is left of path
 
-    # 3. Cross-Track Error (Normal to the path's velocity direction)
-    # If reversing, the mathematical path of travel is 180 degrees from the body yaw
-    path_vel_yaw = tyaw if direction >= 0 else wrap_pi(tyaw + math.pi)
-    
-    dx = cx - tx
-    dy = cy - ty
-    left_nx = -math.sin(path_vel_yaw)
-    left_ny = math.cos(path_vel_yaw)
-    
-    cte = dx * left_nx + dy * left_ny  # Positive means vehicle is left of the path
+    # 3. Control Law with Feedforward
+    v = 20.0  # Nominal speed
+    cte_term = math.atan2(k * cte, (v + softening))
 
-    # 4. Stanley Control Law (Equation A4)
-    v = 20.0  # Nominal speed in cm/s
-    v_abs = abs(v)  # Denominator must be strictly positive magnitude |v_r|
-    
-    cte_term = math.atan2(k * cte, (v_abs + softening))
-
-    # Apply Equation A4 signs (preserving your original servo polarity).
-    # heading_err is multiplied by direction to create an inverse effect in reverse.
-    steer = steer_ff - (heading_err * direction) + cte_term
+    # We add the feedforward term so the servo anticipates the curve.
+    steer = steer_ff - heading_err + cte_term
     steer = wrap_pi(steer)
     
     return steer, int(idx), direction
-
 
 def maybe_init_viz():
     """
@@ -282,7 +263,7 @@ def main():
                 continue
 
             # Progress along path by nearest point in a forward window
-            idx = nearest_index(points, last_pose["x_cm"], last_pose["y_cm"], start_idx=idx, window=500)
+            idx = nearest_index(points, last_pose["x_cm"], last_pose["y_cm"], start_idx=idx, window=50)
 
             steer_rad, idx, direction = stanley_control(points, last_pose, idx)
 
