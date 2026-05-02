@@ -110,7 +110,7 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=0.4, softening_fwd=
     v = 20.0  # Nominal speed
     cte_term = math.atan2(k * cte * cte_direction, (v + softening))
 
-    steer = steer_ff - heading_err + cte_term
+    steer = steer_ff + heading_err - cte_term
     steer = wrap_pi(steer)
     
     return steer, int(idx), direction
