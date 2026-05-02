@@ -109,11 +109,17 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     y = float(pose["y_cm"])
     yaw = float(pose["yaw_rad"])
 
-    # Body-to-body heading (same for forward and reverse segments in the JSON/planner).
-    heading_err = wrap_pi(tyaw - yaw)
-
-    # Motion tangent: reverse gear travels along -body_forward => yaw + pi.
+    # Work in a consistent "motion frame":
+    # - Forward: motion yaw == body yaw
+    # - Reverse: motion yaw == body yaw + pi
+    #
+    # Use the *same* transform for both vehicle yaw and path yaw so we never introduce
+    # an extra pi in the heading error (and we avoid ad-hoc sign flips).
+    yaw_motion = wrap_pi(yaw + (math.pi if direction < 0 else 0.0))
     tyaw_motion = wrap_pi(tyaw + (math.pi if direction < 0 else 0.0))
+
+    # Heading error in motion frame (this reduces to wrap_pi(tyaw - yaw) for both gears).
+    heading_err = wrap_pi(tyaw_motion - yaw_motion)
     dx = x - tx
     dy = y - ty
     left_nx = -math.sin(tyaw_motion)
@@ -123,9 +129,6 @@ def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
     # Nominal longitudinal speed (cm/s); softening avoids blow-up near zero.
     v = 20.0
     cte_term = math.atan2(k * cte, (v + softening))
-    # Cross-track correction must flip sign when velocity is opposite (reverse).
-    if direction < 0:
-        cte_term = -cte_term
 
     steer = -heading_err + cte_term
     steer = wrap_pi(steer)
