@@ -1,0 +1,44 @@
+def stanley_control(points, pose, idx_near, k=1.2, softening=30.0):
+    """
+    Stanley controller in map frame with proper trailing-axle kinematic inversion.
+    """
+    n = len(points)
+    idx = clamp(idx_near, 0, n - 1)
+    p = points[int(idx)]
+
+    tx = float(p["x_cm"])
+    ty = float(p["y_cm"])
+    tyaw = float(p["yaw_rad"])
+    direction = int(p.get("direction", 1))
+
+    x = float(pose["x_cm"])
+    y = float(pose["y_cm"])
+    yaw = float(pose["yaw_rad"])
+
+    # 1. Heading Error
+    # Both tyaw and yaw represent the vehicle's front bumper direction.
+    # The absolute heading difference remains valid regardless of gear.
+    heading_err = wrap_pi(tyaw - yaw)
+
+    # 2. Cross-Track Error
+    # We must use the actual path trajectory (motion_yaw) to determine Left/Right error.
+    motion_yaw = wrap_pi(tyaw + (math.pi if direction < 0 else 0.0))
+    dx = x - tx
+    dy = y - ty
+    left_nx = -math.sin(motion_yaw)
+    left_ny = math.cos(motion_yaw)
+    cte = dx * left_nx + dy * left_ny  # Positive means vehicle is to the LEFT of the path
+
+    # 3. Base Control Law
+    v = 20.0
+    cte_term = math.atan2(k * cte, (v + softening))
+
+    steer = -heading_err + cte_term
+    steer = wrap_pi(steer)
+
+    # 4. Kinematic Inversion for Reverse
+    # In reverse, we actuate the trailing (front) wheels to steer the leading (rear) axle.
+    if direction < 0:
+        steer = -steer
+
+    return steer, int(idx), direction
