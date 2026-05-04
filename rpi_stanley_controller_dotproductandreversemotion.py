@@ -198,10 +198,12 @@ def main():
     POSE_TIMEOUT_S = 0.25
     CMD_TIMEOUT_S = 0.5
 
-    # steering mapping (servo)
-    SERVO_CENTER_DEG = 75.0
-    SERVO_MAX_DELTA_DEG = 25.0
-    MAX_STEER_RAD_FOR_SERVO = math.radians(25.0)  # planner max; maps to +-25deg at servo
+    # steering mapping (servo): straight ≈ 80°, mechanical limits 55°..105° (±25°)
+    SERVO_CENTER_DEG = 80.0
+    SERVO_MIN_DEG = 55.0
+    SERVO_MAX_DEG = 105.0
+    SERVO_MAX_DELTA_DEG = (SERVO_MAX_DEG - SERVO_MIN_DEG) / 2.0  # 25; scale full steer to limit range
+    MAX_STEER_RAD_FOR_SERVO = math.radians(25.0)  # planner max; maps to ±SERVO_MAX_DELTA_DEG at servo
     SERVO_MAX_SPEED_DEG_S = 60.0  # limit how fast servo command changes
 
     # throttle mapping
@@ -358,7 +360,7 @@ def main():
             steer_rad = clamp(steer_rad, -MAX_STEER_RAD_FOR_SERVO, MAX_STEER_RAD_FOR_SERVO)
             # Steering sign/mapping intentionally left as-is (per user request).
             servo_deg = SERVO_CENTER_DEG + (steer_rad / MAX_STEER_RAD_FOR_SERVO) * SERVO_MAX_DELTA_DEG
-            servo_deg = clamp(servo_deg, SERVO_CENTER_DEG - SERVO_MAX_DELTA_DEG, SERVO_CENTER_DEG + SERVO_MAX_DELTA_DEG)
+            servo_deg = clamp(servo_deg, SERVO_MIN_DEG, SERVO_MAX_DEG)
             # Rate-limit servo so it doesn't snap to large angles instantly
             max_delta = SERVO_MAX_SPEED_DEG_S * dt
             servo_deg = rate_limit(servo_deg, last_servo_deg, max_delta=max_delta)
