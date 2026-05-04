@@ -88,9 +88,13 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     return best_i
 
 
-def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=30.0, softening_rev=50.0):
+# Planner wheelbase (cm): rear axle to front axle. Used as rear-offset from localized “front” in reverse CTE.
+STANLEY_WB_CM = 18.75
+
+
+def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=30.0, softening_rev=35.0):
     """
-    Front-Axle Stanley with Planner Feedforward and True Kinematic Reverse.
+    Front-axle Stanley with planner feedforward; reverse uses rear-axle position for CTE only.
     """
     n = len(points)
     idx = clamp(idx_near, 0, n - 1)
@@ -104,18 +108,23 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=
     # Perfect kinematic steering angle from the Hybrid A* planner
     steer_ff = float(p.get("steer_rad", 0.0))
 
-    x = float(pose["x_cm"])
-    y = float(pose["y_cm"])
+    x_front = float(pose["x_cm"])
+    y_front = float(pose["y_cm"])
     yaw = float(pose["yaw_rad"])
 
-    # 1. True Heading Error (Nose to Nose)
-    # We NO LONGER add pi. tyaw and yaw both represent the car's physical body orientation.
+    # 1. True Heading Error (unchanged: same body yaw as localization)
     heading_err = wrap_pi(tyaw - yaw)
 
-    # 2. Cross-Track Error
-    # Normal is based on the target body orientation
-    dx = x - tx
-    dy = y - ty
+    # 2. Cross-track reference: forward = localized point; reverse = rear axle from user formula
+    if direction < 0:
+        x_track = x_front - STANLEY_WB_CM * math.sin(yaw)
+        y_track = y_front - STANLEY_WB_CM * math.cos(yaw)
+    else:
+        x_track = x_front
+        y_track = y_front
+
+    dx = x_track - tx
+    dy = y_track - ty
     left_nx = -math.sin(tyaw)
     left_ny = math.cos(tyaw)
     cte = dx * left_nx + dy * left_ny  # +: vehicle is physically to the left of the target line
@@ -210,7 +219,7 @@ def main():
     THROTTLE_MIN_MOVING = 110  # don't go below this unless stopping
 
     # Localization jump filter
-    LOCAL_JUMP_DIST_CM = 25.0
+    LOCAL_JUMP_DIST_CM = 7.0
     LOCAL_PENDING_MATCH_CYCLES = 5
     LOCAL_PENDING_POS_TOL_CM = 6.0
     LOCAL_PENDING_YAW_TOL_DEG = 12.0
