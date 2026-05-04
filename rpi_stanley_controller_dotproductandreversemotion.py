@@ -88,8 +88,30 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     return best_i
 
 
-# Planner wheelbase (cm): rear axle to front axle. Used as rear-offset from localized “front” in reverse CTE.
-STANLEY_WB_CM = 18.75
+# Planner wheelbase (cm): rear axle to front axle. Used as rear-offset from localized “front” in reverse CTE / index tracking.
+STANLEY_WB_CM = 16
+
+
+def path_tracking_point_cm(pose: dict, points: list, idx_near: int) -> tuple[float, float]:
+    """
+    Map position used to find nearest path index: same as localized pose in forward;
+    in reverse, rear axle (matches reverse CTE reference).
+    Uses direction on the path point at idx_near (clamped).
+    """
+    n = len(points)
+    if n == 0:
+        return float(pose["x_cm"]), float(pose["y_cm"])
+    i = clamp(int(idx_near), 0, n - 1)
+    seg_dir = int(points[i].get("direction", 1))
+    xf = float(pose["x_cm"])
+    yf = float(pose["y_cm"])
+    psi = float(pose["yaw_rad"])
+    if seg_dir < 0:
+        return (
+            xf - STANLEY_WB_CM * math.sin(psi),
+            yf - STANLEY_WB_CM * math.cos(psi),
+        )
+    return xf, yf
 
 
 def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=30.0, softening_rev=35.0):
@@ -117,8 +139,8 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=
 
     # 2. Cross-track reference: forward = localized point; reverse = rear axle from user formula
     if direction < 0:
-        x_track = x_front - STANLEY_WB_CM * math.sin(yaw)
-        y_track = y_front - STANLEY_WB_CM * math.cos(yaw)
+        x_track = x_front - STANLEY_WB_CM * math.cos(yaw)
+        y_track = y_front - STANLEY_WB_CM * math.sin(yaw)
     else:
         x_track = x_front
         y_track = y_front
@@ -320,8 +342,9 @@ def main():
                 time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                 continue
 
-            # Progress along path by nearest point in a forward window
-            idx = nearest_index(points, last_pose["x_cm"], last_pose["y_cm"], start_idx=idx, window=5)
+            # Progress along path: in reverse, snap index using rear-axle position (same as reverse CTE).
+            tx, ty = path_tracking_point_cm(last_pose, points, idx)
+            idx = nearest_index(points, tx, ty, start_idx=idx, window=5)
 
             # Distance-to-goal (used for STOP condition / debug / min throttle)
             gx = float(points[-1]["x_cm"])
