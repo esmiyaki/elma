@@ -198,8 +198,10 @@ def main():
     # throttle mapping
     THROTTLE_FWD = 160  # 0..255
     THROTTLE_REV = 140  # 0..255 (often safer a bit lower)
-    # End of route: stop if this far *past* the last point along travel direction (overshoot)
+    # End of route: stop if this far *past* the last point along travel direction (overshoot).
+    # Only applies when tracked index is in the last N path points (avoids false positives mid-route).
     PAST_GOAL_LONG_CM = 3.0
+    PAST_GOAL_CHECK_LAST_POINTS = 10
     # Stanley-style end: near last point in space and progressed along path
     END_DIST_CM = 3.0
     END_MIN_IDX_FROM_TAIL = 30
@@ -315,11 +317,12 @@ def main():
             gy = float(points[-1]["y_cm"])
             dist_goal = math.hypot(last_pose["x_cm"] - gx, last_pose["y_cm"] - gy)
 
-            # Overshoot: past final point along travel direction (Stanley alone may not cut throttle)
-            if is_past_path_end(last_pose, points, PAST_GOAL_LONG_CM):
+            # Overshoot: longitudinal past final point (dot check). Only near end of path by index.
+            tail_gate = idx >= max(0, len(points) - PAST_GOAL_CHECK_LAST_POINTS)
+            if tail_gate and is_past_path_end(last_pose, points, PAST_GOAL_LONG_CM):
                 print(
                     f"[STOP] Past path end (>{PAST_GOAL_LONG_CM:.1f} cm along travel); "
-                    f"dist_goal={dist_goal:.1f} cm"
+                    f"dist_goal={dist_goal:.1f} cm idx={idx}"
                 )
                 ser.write(b"STOP\n")
                 last_cmd_t = time.perf_counter()
