@@ -189,6 +189,7 @@ def maybe_init_viz():
         except Exception:
             pass
         import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
     except Exception:
         return None
 
@@ -200,14 +201,54 @@ def maybe_init_viz():
     ax.set_title("Stanley follower debug view")
 
     (path_line,) = ax.plot([], [], "k-", lw=2, alpha=0.5, label="planned path")
-    (car_pt,) = ax.plot([], [], "go", ms=8, label="car")
-    (car_head,) = ax.plot([], [], "g-", lw=2)
+    # Reference point used by controller (switches in reverse)
+    (ref_pt,) = ax.plot([], [], "go", ms=8, label="ref (CTE/index)")
+    (ref_head,) = ax.plot([], [], "g-", lw=2)
+    # Car body (drawn at raw localized pose; does NOT switch with gear)
+    car_poly = patches.Polygon([[0, 0]], closed=True, fc="#00ced1", ec="black", alpha=0.55, zorder=5)
+    ax.add_patch(car_poly)
+    (car_head,) = ax.plot([], [], "r-", lw=2, zorder=6)
     (target_pt,) = ax.plot([], [], "rx", ms=10, label="target")
     (near_pt,) = ax.plot([], [], "bo", ms=6, label="nearest")
     txt = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", ha="left")
     ax.legend(loc="upper right")
 
-    return plt, fig, ax, {"path_line": path_line, "car_pt": car_pt, "car_head": car_head, "target_pt": target_pt, "near_pt": near_pt, "txt": txt}
+    return plt, fig, ax, {
+        "path_line": path_line,
+        "ref_pt": ref_pt,
+        "ref_head": ref_head,
+        "car_poly": car_poly,
+        "car_head": car_head,
+        "target_pt": target_pt,
+        "near_pt": near_pt,
+        "txt": txt,
+    }
+
+
+def _car_body_polygon_xy(
+    x_cm: float,
+    y_cm: float,
+    yaw_rad: float,
+    *,
+    car_l_cm: float = 25.0,
+    car_w_cm: float = 18.0,
+) -> list[tuple[float, float]]:
+    """
+    Simple rectangular car footprint for debug viz.
+    It is centered at (x_cm, y_cm) so it won't jump when gear changes.
+    """
+    hl = 0.5 * float(car_l_cm)
+    hw = 0.5 * float(car_w_cm)
+    # local rectangle corners (closed)
+    pts = [(-hl, -hw), (hl, -hw), (hl, hw), (-hl, hw), (-hl, -hw)]
+    c = math.cos(yaw_rad)
+    s = math.sin(yaw_rad)
+    out = []
+    for px, py in pts:
+        rx = px * c - py * s + x_cm
+        ry = px * s + py * c + y_cm
+        out.append((rx, ry))
+    return out
 
 
 def main():
@@ -414,20 +455,30 @@ def main():
 
             # Debug visualization update (non-blocking)
             if viz is not None:
-                # Visualization point:
-                # - Forward: show the localized (front) point
-                # - Reverse: show the rear axle point (matches reverse tracking/CTE reference)
+                # Raw localized pose (car drawing anchor; does NOT switch with gear)
                 x_front = float(last_pose["x_cm"])
                 y_front = float(last_pose["y_cm"])
                 yaw = float(last_pose["yaw_rad"])
+
+                # Reference point (switches in reverse: rear axle)
                 if direction < 0:
-                    x = x_front - STANLEY_WB_CM * math.cos(yaw)
-                    y = y_front - STANLEY_WB_CM * math.sin(yaw)
+                    x_ref = x_front - STANLEY_WB_CM * math.sin(yaw)
+                    y_ref = y_front - STANLEY_WB_CM * math.cos(yaw)
                 else:
-                    x, y = x_front, y_front
+                    x_ref, y_ref = x_front, y_front
                 head_len = 12.0
-                artists["car_pt"].set_data([x], [y])
-                artists["car_head"].set_data([x, x + head_len * math.cos(yaw)], [y, y + head_len * math.sin(yaw)])
+                artists["ref_pt"].set_data([x_ref], [y_ref])
+                artists["ref_head"].set_data(
+                    [x_ref, x_ref + head_len * math.cos(yaw)],
+                    [y_ref, y_ref + head_len * math.sin(yaw)],
+                )
+
+                # Car body + heading arrow at raw localized pose
+                artists["car_poly"].set_xy(_car_body_polygon_xy(x_front, y_front, yaw))
+                artists["car_head"].set_data(
+                    [x_front, x_front + head_len * math.cos(yaw)],
+                    [y_front, y_front + head_len * math.sin(yaw)],
+                )
                 artists["near_pt"].set_data([points[idx]["x_cm"]], [points[idx]["y_cm"]])
                 artists["txt"].set_text(
                     f"idx={idx}/{len(points)} dir={'F' if direction>0 else 'R'}\n"
