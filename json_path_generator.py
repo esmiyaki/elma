@@ -309,41 +309,27 @@ class PathGeneratorUI:
             start_pose = (path[0][0], path[0][1], path[0][2])
         target_pose = (path[-1][0], path[-1][1], path[-1][2])
 
-        points_out = []
+        REAR_AXLE_OFFSET_CM = 16.0
+        json_points = []
         for (x, y, yaw, d, steer) in path:
-            d = int(d)
-            yaw_f = float(yaw)
-            x_f = float(x)
-            y_f = float(y)
-            # When reversing, write rear-axle position into JSON (per user request).
-            # Note: yaw stays the same.
-            if d < 0:
-                x_cm = x_f * float(math.cos(yaw_f))
-                y_cm = y_f * float(math.sin(yaw_f))
-            else:
-                x_cm = x_f
-                y_cm = y_f
-            points_out.append(
+            x_out = float(x)
+            y_out = float(y)
+            yaw_out = float(yaw)
+            d_out = int(d)
+            steer_out = float(steer)
+            # For reverse segments, export rear-axle position instead of front.
+            if d_out < 0:
+                x_out = x_out - REAR_AXLE_OFFSET_CM * math.cos(yaw_out)
+                y_out = y_out - REAR_AXLE_OFFSET_CM * math.sin(yaw_out)
+            json_points.append(
                 {
-                    "x_cm": float(x_cm),
-                    "y_cm": float(y_cm),
-                    "yaw_rad": float(yaw_f),
-                    "direction": int(d),
-                    "steer_rad": float(steer),
+                    "x_cm": x_out,
+                    "y_cm": y_out,
+                    "yaw_rad": yaw_out,
+                    "direction": d_out,
+                    "steer_rad": steer_out,
                 }
             )
-
-        # Mirror pathcreation fix: make first point direction match first segment,
-        # and if that direction is reverse, recompute exported x/y accordingly.
-        if len(points_out) >= 2:
-            points_out[0]["direction"] = int(points_out[1]["direction"])
-            points_out[0]["steer_rad"] = float(points_out[1]["steer_rad"])
-            if int(points_out[0]["direction"]) < 0:
-                yaw0 = float(points_out[0]["yaw_rad"])
-                x0 = float(path[0][0])
-                y0 = float(path[0][1])
-                points_out[0]["x_cm"] = float(x0 * float(math.cos(yaw0)))
-                points_out[0]["y_cm"] = float(y0 * float(math.sin(yaw0)))
 
         data = {
             "version": 1,
@@ -356,7 +342,7 @@ class PathGeneratorUI:
                 "y_cm": float(target_pose[1]),
                 "yaw_rad": float(target_pose[2]),
             },
-            "points": points_out,
+            "points": json_points,
         }
 
         filename = "planned_path.json"
