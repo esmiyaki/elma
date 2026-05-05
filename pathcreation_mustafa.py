@@ -468,35 +468,6 @@ def run_simulation():
         return
 
     sx, sy, syaw = start_pose
-    car_at_start = get_car_polygon(sx, sy, syaw)
-    preview_obs_list = list(make_wall_obstacles(MAP_SIZE))
-    for o in ed.custom_obstacles:
-        preview_obs_list.append(
-            translate(rotate(box(-5, -5, 5, 5), o[2], use_radians=True), o[0], o[1]))
-    for s in slots:
-        if s["id"] in sel.occupied_ids:
-            p = translate(
-                rotate(box(-SLOT_D / 2, -SLOT_W / 2, SLOT_D / 2, SLOT_W / 2), s["yaw"], use_radians=True),
-                s["cx"],
-                s["cy"],
-            )
-            preview_obs_list.append(p)
-
-    collision = False
-    for obs in preview_obs_list:
-        if isinstance(obs, Polygon) and obs.intersects(car_at_start):
-            collision = True
-            break
-
-    if collision:
-        messagebox.showerror(
-            "Start pose collision",
-            f"AprilTag start ({sx:.1f}, {sy:.1f}) overlaps an obstacle/slot obstacle.\n"
-            "Adjust the car or obstacle layout.",
-        )
-        print(f"[X] Start pose collides at ({sx:.1f}, {sy:.1f}) rad={syaw:.3f}")
-        return
-
     print(
         f"[*] Start from AprilTag: x={sx:.2f} y={sy:.2f} cm, "
         f"yaw_deg(tag)={(np.rad2deg(syaw - np.pi / 2) % 360):.1f} → planner_yaw={np.rad2deg(syaw):.2f}°"
