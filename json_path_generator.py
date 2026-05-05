@@ -19,7 +19,6 @@ from apriltag_pose import get_latest_map_pose
 
 
 MAP_SIZE = 200.0  # cm
-AXLE_FRONT_TO_REAR_CM = 16.0  # cm (front axle to rear axle)
 
 # Slot geometry (same as pathcreation.py)
 SLOT_W, SLOT_D = 25.0, 40.0  # cm
@@ -105,10 +104,6 @@ def resample_polyline(points: List[ControlPoint], step_cm: float) -> List[Tuple[
         n = max(1, int(math.floor(seg_len / step_cm)))
         for k in range(n):
             t = (k * step_cm) / seg_len
-            # Control points are authored in the follow-point frame:
-            # - Forward: front axle
-            # - Reverse: rear axle
-            # so do not apply any axle shift here.
             x = p0.x + t * dx
             y = p0.y + t * dy
             out.append((float(x), float(y), float(yaw), direction, 0.0))
@@ -119,7 +114,6 @@ def resample_polyline(points: List[ControlPoint], step_cm: float) -> List[Tuple[
     dy = points[-1].y - points[-2].y
     tangent = math.atan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-6 else 0.0
     last_yaw = tangent if last_dir > 0 else normalize_angle(tangent + math.pi)
-    # Final control point is already in the follow-point frame.
     out.append((float(points[-1].x), float(points[-1].y), float(last_yaw), last_dir, 0.0))
 
     # Make sure the very first point direction matches first motion (like pathcreation fix)
@@ -226,14 +220,8 @@ class PathGeneratorUI:
     def _clear(self, event=None):
         # Keep the start point (index 0) if it exists
         if self.start_pose is not None:
-            x_front, y_front, syaw = self.start_pose
-            if self.current_direction < 0:
-                # For REV, keep the *control point* at rear axle.
-                x0 = x_front - AXLE_FRONT_TO_REAR_CM * math.sin(syaw)
-                y0 = y_front - AXLE_FRONT_TO_REAR_CM * math.cos(syaw)
-            else:
-                x0, y0 = x_front, y_front
-            self.control_points = [ControlPoint(x=x0, y=y0, direction=self.current_direction)]
+            x, y, _ = self.start_pose
+            self.control_points = [ControlPoint(x=x, y=y, direction=self.current_direction)]
         else:
             self.control_points = []
         self._update_plot()
@@ -249,24 +237,15 @@ class PathGeneratorUI:
         if p is None:
             print("[X] No AprilTag detected. Start pose not set.")
             return
-        x_front = float(p["x_cm"])
-        y_front = float(p["y_cm"])
+        x = float(p["x_cm"])
+        y = float(p["y_cm"])
         yaw = normalize_angle(math.radians(float(p["yaw_deg"])) + (math.pi / 2.0))
-        self.start_pose = (x_front, y_front, yaw)
-
-        # Control points represent the follow point:
-        # - FWD: front axle
-        # - REV: rear axle (16cm behind front), yaw unchanged
-        if self.current_direction < 0:
-            x_cp = x_front - AXLE_FRONT_TO_REAR_CM * math.sin(yaw)
-            y_cp = y_front - AXLE_FRONT_TO_REAR_CM * math.cos(yaw)
-        else:
-            x_cp, y_cp = x_front, y_front
+        self.start_pose = (x, y, yaw)
         # Set/overwrite first control point as start
         if self.control_points:
-            self.control_points[0] = ControlPoint(x=x_cp, y=y_cp, direction=self.current_direction)
+            self.control_points[0] = ControlPoint(x=x, y=y, direction=self.current_direction)
         else:
-            self.control_points.append(ControlPoint(x=x_cp, y=y_cp, direction=self.current_direction))
+            self.control_points.append(ControlPoint(x=x, y=y, direction=self.current_direction))
         # Ensure start point direction matches current gear for the first segment.
         self.control_points[-1].direction = self.current_direction
 
@@ -323,10 +302,9 @@ class PathGeneratorUI:
             print("[X] Need at least 2 points.")
             return
 
-        # Use AprilTag yaw for JSON start if available, but keep position consistent with exported path.
+        # Use AprilTag start pose for JSON start if available
         if self.start_pose is not None:
-            _, _, syaw = self.start_pose
-            start_pose = (path[0][0], path[0][1], syaw)
+            start_pose = self.start_pose
         else:
             start_pose = (path[0][0], path[0][1], path[0][2])
         target_pose = (path[-1][0], path[-1][1], path[-1][2])
