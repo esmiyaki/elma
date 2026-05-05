@@ -108,8 +108,8 @@ def path_tracking_point_cm(pose: dict, points: list, idx_near: int) -> tuple[flo
     psi = float(pose["yaw_rad"])
     if seg_dir < 0:
         return (
-            xf - STANLEY_WB_CM * math.sin(psi),
-            yf - STANLEY_WB_CM * math.cos(psi),
+            xf - STANLEY_WB_CM * math.cos(psi),
+            yf - STANLEY_WB_CM * math.sin(psi),
         )
     return xf, yf
 
@@ -414,9 +414,17 @@ def main():
 
             # Debug visualization update (non-blocking)
             if viz is not None:
-                x = last_pose["x_cm"]
-                y = last_pose["y_cm"]
-                yaw = last_pose["yaw_rad"]
+                # Visualization point:
+                # - Forward: show the localized (front) point
+                # - Reverse: show the rear axle point (matches reverse tracking/CTE reference)
+                x_front = float(last_pose["x_cm"])
+                y_front = float(last_pose["y_cm"])
+                yaw = float(last_pose["yaw_rad"])
+                if direction < 0:
+                    x = x_front - STANLEY_WB_CM * math.cos(yaw)
+                    y = y_front - STANLEY_WB_CM * math.sin(yaw)
+                else:
+                    x, y = x_front, y_front
                 head_len = 12.0
                 artists["car_pt"].set_data([x], [y])
                 artists["car_head"].set_data([x, x + head_len * math.cos(yaw)], [y, y + head_len * math.sin(yaw)])
