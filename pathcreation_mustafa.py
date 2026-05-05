@@ -31,7 +31,8 @@ from planner_v2 import hybrid_a_star_v2
 MAP_SIZE = 200
 
 # 1. Controller Safety Settings
-SAFE_MARGIN = 2.0
+# No safety margin / wall safety in this variant.
+SAFE_MARGIN = 0.0
 
 # 2. Target Tolerance Settings (AYARLANABİLİR TOLERANSLAR)
 FINAL_XY_TOLERANCE = 5.0
@@ -475,7 +476,7 @@ def run_simulation():
 
     is_reverse_park = mode_sel.is_reverse_park
 
-    obs_list = make_wall_obstacles(MAP_SIZE)
+    obs_list = []
     for o in ed.custom_obstacles: obs_list.append(
         translate(rotate(box(-5, -5, 5, 5), o[2], use_radians=True), o[0], o[1]))
 
