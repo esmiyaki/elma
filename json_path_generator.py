@@ -19,6 +19,7 @@ from apriltag_pose import get_latest_map_pose
 
 
 MAP_SIZE = 200.0  # cm
+AXLE_FRONT_TO_REAR_CM = 16.0  # cm (front axle to rear axle)
 
 # Slot geometry (same as pathcreation.py)
 SLOT_W, SLOT_D = 25.0, 40.0  # cm
@@ -104,8 +105,14 @@ def resample_polyline(points: List[ControlPoint], step_cm: float) -> List[Tuple[
         n = max(1, int(math.floor(seg_len / step_cm)))
         for k in range(n):
             t = (k * step_cm) / seg_len
-            x = p0.x + t * dx
-            y = p0.y + t * dy
+            x_front = p0.x + t * dx
+            y_front = p0.y + t * dy
+            if direction < 0:
+                # Follow rear axle in reverse, keep yaw unchanged.
+                x = x_front - AXLE_FRONT_TO_REAR_CM * math.cos(yaw)
+                y = y_front - AXLE_FRONT_TO_REAR_CM * math.sin(yaw)
+            else:
+                x, y = x_front, y_front
             out.append((float(x), float(y), float(yaw), direction, 0.0))
 
     # Add final point with last segment's yaw/direction
@@ -114,7 +121,14 @@ def resample_polyline(points: List[ControlPoint], step_cm: float) -> List[Tuple[
     dy = points[-1].y - points[-2].y
     tangent = math.atan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-6 else 0.0
     last_yaw = tangent if last_dir > 0 else normalize_angle(tangent + math.pi)
-    out.append((float(points[-1].x), float(points[-1].y), float(last_yaw), last_dir, 0.0))
+    end_x_front = float(points[-1].x)
+    end_y_front = float(points[-1].y)
+    if last_dir < 0:
+        end_x = end_x_front - AXLE_FRONT_TO_REAR_CM * math.cos(last_yaw)
+        end_y = end_y_front - AXLE_FRONT_TO_REAR_CM * math.sin(last_yaw)
+    else:
+        end_x, end_y = end_x_front, end_y_front
+    out.append((float(end_x), float(end_y), float(last_yaw), last_dir, 0.0))
 
     # Make sure the very first point direction matches first motion (like pathcreation fix)
     if len(out) >= 2:
@@ -302,34 +316,18 @@ class PathGeneratorUI:
             print("[X] Need at least 2 points.")
             return
 
-        # Use AprilTag start pose for JSON start if available
+        # Use AprilTag start pose for JSON start if available.
+        # If the first segment is reverse, convert start (front axle) -> rear axle for consistency.
         if self.start_pose is not None:
-            start_pose = self.start_pose
+            sx, sy, syaw = self.start_pose
+            first_dir = int(path[0][3])
+            if first_dir < 0:
+                sx = sx - AXLE_FRONT_TO_REAR_CM * math.cos(syaw)
+                sy = sy - AXLE_FRONT_TO_REAR_CM * math.sin(syaw)
+            start_pose = (sx, sy, syaw)
         else:
             start_pose = (path[0][0], path[0][1], path[0][2])
         target_pose = (path[-1][0], path[-1][1], path[-1][2])
-
-        REAR_AXLE_OFFSET_CM = 16.0
-        json_points = []
-        for (x, y, yaw, d, steer) in path:
-            x_out = float(x)
-            y_out = float(y)
-            yaw_out = float(yaw)
-            d_out = int(d)
-            steer_out = float(steer)
-            # For reverse segments, export rear-axle position instead of front.
-            if d_out < 0:
-                x_out = x_out - REAR_AXLE_OFFSET_CM * math.cos(yaw_out)
-                y_out = y_out - REAR_AXLE_OFFSET_CM * math.sin(yaw_out)
-            json_points.append(
-                {
-                    "x_cm": x_out,
-                    "y_cm": y_out,
-                    "yaw_rad": yaw_out,
-                    "direction": d_out,
-                    "steer_rad": steer_out,
-                }
-            )
 
         data = {
             "version": 1,
@@ -342,7 +340,10 @@ class PathGeneratorUI:
                 "y_cm": float(target_pose[1]),
                 "yaw_rad": float(target_pose[2]),
             },
-            "points": json_points,
+            "points": [
+                {"x_cm": float(x), "y_cm": float(y), "yaw_rad": float(yaw), "direction": int(d), "steer_rad": float(steer)}
+                for (x, y, yaw, d, steer) in path
+            ],
         }
 
         filename = "planned_path.json"
