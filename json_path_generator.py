@@ -309,6 +309,42 @@ class PathGeneratorUI:
             start_pose = (path[0][0], path[0][1], path[0][2])
         target_pose = (path[-1][0], path[-1][1], path[-1][2])
 
+        points_out = []
+        for (x, y, yaw, d, steer) in path:
+            d = int(d)
+            yaw_f = float(yaw)
+            x_f = float(x)
+            y_f = float(y)
+            # When reversing, write rear-axle position into JSON (per user request).
+            # Note: yaw stays the same.
+            if d < 0:
+                x_cm = x_f * float(math.cos(yaw_f))
+                y_cm = y_f * float(math.sin(yaw_f))
+            else:
+                x_cm = x_f
+                y_cm = y_f
+            points_out.append(
+                {
+                    "x_cm": float(x_cm),
+                    "y_cm": float(y_cm),
+                    "yaw_rad": float(yaw_f),
+                    "direction": int(d),
+                    "steer_rad": float(steer),
+                }
+            )
+
+        # Mirror pathcreation fix: make first point direction match first segment,
+        # and if that direction is reverse, recompute exported x/y accordingly.
+        if len(points_out) >= 2:
+            points_out[0]["direction"] = int(points_out[1]["direction"])
+            points_out[0]["steer_rad"] = float(points_out[1]["steer_rad"])
+            if int(points_out[0]["direction"]) < 0:
+                yaw0 = float(points_out[0]["yaw_rad"])
+                x0 = float(path[0][0])
+                y0 = float(path[0][1])
+                points_out[0]["x_cm"] = float(x0 * float(math.cos(yaw0)))
+                points_out[0]["y_cm"] = float(y0 * float(math.sin(yaw0)))
+
         data = {
             "version": 1,
             "generated_at_unix_s": time.time(),
@@ -320,10 +356,7 @@ class PathGeneratorUI:
                 "y_cm": float(target_pose[1]),
                 "yaw_rad": float(target_pose[2]),
             },
-            "points": [
-                {"x_cm": float(x), "y_cm": float(y), "yaw_rad": float(yaw), "direction": int(d), "steer_rad": float(steer)}
-                for (x, y, yaw, d, steer) in path
-            ],
+            "points": points_out,
         }
 
         filename = "planned_path.json"
