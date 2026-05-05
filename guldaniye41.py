@@ -16,6 +16,7 @@ import json
 import time
 import tkinter as tk
 from tkinter import messagebox
+from apriltag_pose import get_latest_map_pose
 
 sys.stdout.reconfigure(encoding='utf-8')
 from shapely.geometry import Polygon, box, Point
@@ -75,6 +76,21 @@ def add_exit_btn(fig):
         sys.exit(0)
     btn.on_clicked(on_exit)
     return btn
+
+
+def get_start_pose_from_apriltag(*, timeout_s=8.0, target_fps=10.0):
+    """
+    Read one AprilTag-based map pose and convert it to this planner's yaw convention:
+      apriltag yaw: 0° = +Y, CCW+
+      planner yaw:  0 rad = +X, CCW+
+    """
+    pose = get_latest_map_pose(timeout_s=timeout_s, target_fps=target_fps)
+    if pose is None:
+        return None
+    x_cm = float(pose["x_cm"])
+    y_cm = float(pose["y_cm"])
+    yaw_rad = normalize_angle(np.deg2rad(float(pose["yaw_deg"])) + (np.pi / 2.0))
+    return (x_cm, y_cm, yaw_rad)
 
 def save_path_json(path, start_pose, target_slot_id, target_pose, filename="planned_path.json"):
     points = [
@@ -691,8 +707,6 @@ def run_simulation():
         
         sel = MapSelector(slots, ed.custom_obstacles); plt.show()
         if not sel.done or sel.target_id is None: return
-        dp_sel = DirectionAndPoseSelector(slots, sel.occupied_ids, ed.custom_obstacles, sel.target_id); plt.show()
-        if not dp_sel.done: return
         plt.close('all')
 
         obs_list = [box(0,0,MAP_SIZE,0), box(0,MAP_SIZE,MAP_SIZE,MAP_SIZE), box(0,0,0,MAP_SIZE), box(MAP_SIZE,0,MAP_SIZE,MAP_SIZE)]
@@ -716,7 +730,19 @@ def run_simulation():
         primary_y = goal_in_y
         mode_str = "FORWARD"
 
-        current_start = dp_sel.start_pose
+        current_start = get_start_pose_from_apriltag()
+        if current_start is None:
+            messagebox.showerror(
+                "AprilTag",
+                "Could not read latest map pose. Run apriltag_pose with a locked tag pose first.",
+            )
+            return
+
+        sx, sy, syaw = current_start
+        print(
+            f"[*] Start from AprilTag: x={sx:.2f} y={sy:.2f} cm, "
+            f"yaw_deg(tag)={(np.rad2deg(syaw - np.pi / 2) % 360):.1f} -> planner_yaw={np.rad2deg(syaw):.2f} deg"
+        )
         current_target = (primary_x, primary_y, primary_yaw)
         is_summon = False
 
