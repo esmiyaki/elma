@@ -16,6 +16,8 @@ import json
 import time
 import tkinter as tk
 from tkinter import messagebox
+
+# AprilTag-based localization (map pose)
 from apriltag_pose import get_latest_map_pose
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -28,9 +30,9 @@ MAP_SIZE = 200
 # 1. Controller Safety Settings
 SAFE_MARGIN = 2.0  
 
-# 2. Target Tolerance Settings (AYARLANABİLİR TOLERANSLAR)
-FINAL_XY_TOLERANCE = 2.0                
-FINAL_YAW_TOLERANCE = np.deg2rad(5.0)  
+# 2. Target Tolerance Settings 
+FINAL_XY_TOLERANCE = 5.0                
+FINAL_YAW_TOLERANCE = np.deg2rad(10.0)  
 
 # Car Specs
 CAR_L, CAR_W = 25.0, 18.0
@@ -83,6 +85,7 @@ def get_start_pose_from_apriltag(*, timeout_s=8.0, target_fps=10.0):
     Read one AprilTag-based map pose and convert it to this planner's yaw convention:
       apriltag yaw: 0° = +Y, CCW+
       planner yaw:  0 rad = +X, CCW+
+    Returns (x_cm, y_cm, yaw_rad) or None if no tag is detected.
     """
     pose = get_latest_map_pose(timeout_s=timeout_s, target_fps=target_fps)
     if pose is None:
@@ -502,7 +505,7 @@ def hybrid_a_star(start, goal, obstacles, mode="FORWARD"):
     hw = 4.0 if mode == "SUMMON" else H_WEIGHT
     analytic_dist = 50.0 if mode == "SUMMON" else ANALYTIC_SHOT_DIST
 
-    # Merkezi Maliyet (Heuristic) Fonksiyonu
+    # Merkezi Maliyet (Heuristic) Fonksiyonu: VIRTUAL LINE ENTEGRASYONU
     def calc_heuristic(nx, ny, nyaw):
         dist_to_goal = math.hypot(nx - gx, ny - gy)
         angle_err = abs(normalize_angle(nyaw - gyaw))
@@ -511,13 +514,23 @@ def hybrid_a_star(start, goal, obstacles, mode="FORWARD"):
             h_angle = angle_err * 10.0 if angle_err > yaw_tol else 0.0
             return (dist_to_goal + h_angle) * hw
             
-        # Aracın park çizgisine olan dik (lateral) uzaklığı
+        # 1. Sanal Çizgi Sapması (Cross-Track Error)
         cross_track_err = abs((nx - gx) * math.sin(gyaw) - (ny - gy) * math.cos(gyaw))
-        proximity = math.exp(-dist_to_goal / 40.0)
-        alignment_cost = cross_track_err * proximity * 2.0
-        angle_cost = angle_err * (10.0 + 15.0 * proximity)
         
-        return (dist_to_goal + angle_cost + alignment_cost) * hw
+        # 2. İzdüşüm Mesafesi (Longitudinal Distance) - Araç yuvaya ne kadar uzak?
+        long_dist = (gx - nx) * math.cos(gyaw) + (gy - ny) * math.sin(gyaw)
+        
+        # 3. SANAL ÇİZGİYE OTURTMA (VIRTUAL LINE METHOD)
+        # Eğer araç yuvanın önündeki alandaysa (0 - 80cm) sanal çizgiye sertçe çek!
+        virtual_line_cost = 0.0
+        if 0 < long_dist < 80.0:
+            virtual_line_cost = cross_track_err * 20.0  
+            
+        proximity = math.exp(-dist_to_goal / 40.0)
+        alignment_cost = cross_track_err * proximity * 5.0
+        angle_cost = angle_err * (10.0 + 20.0 * proximity)
+        
+        return (dist_to_goal + angle_cost + alignment_cost + virtual_line_cost) * hw
 
     h_start = calc_heuristic(start[0], start[1], start[2])
     start_node = Node(*start, 0, h_start)
@@ -538,7 +551,7 @@ def hybrid_a_star(start, goal, obstacles, mode="FORWARD"):
 
         dist_to_goal = np.hypot(curr.x-gx, curr.y-gy)
         
-        # 1. ERKEN DURMA (Dinamik Tolerans Kullanımı)
+        # 1. ERKEN DURMA 
         if dist_to_goal <= xy_tol and abs(normalize_angle(curr.yaw - gyaw)) <= yaw_tol:
             ang_err = np.rad2deg(abs(normalize_angle(curr.yaw - gyaw)))
             print(f"[OK] Hedefe ulaşıldı (A* Tolerans içi: {ang_err:.1f}° sapma)! Adım: {iter_count}")
@@ -555,26 +568,19 @@ def hybrid_a_star(start, goal, obstacles, mode="FORWARD"):
         cross_track_err = abs((curr.x - gx) * math.sin(gyaw) - (curr.y - gy) * math.cos(gyaw))
         curr_angle_err = abs(normalize_angle(curr.yaw - gyaw))
         
-        is_aligned = (cross_track_err < 10.0 and curr_angle_err < np.deg2rad(20.0))
-        can_shoot = (mode == "SUMMON") or (dist_to_goal < 80.0 and is_aligned) or (dist_to_goal < 15.0)
+        # VIRTUAL LINE KURALI: Araba yuvaya hizalanmadan atış yapmasını kesinlikle yasakla!
+        is_aligned = (cross_track_err < 5.0 and curr_angle_err < np.deg2rad(10.0))
+        can_shoot = (mode == "SUMMON") or (dist_to_goal < 60.0 and is_aligned) or (dist_to_goal < 15.0)
         
         # 2. ANALİTİK ATIŞ
         if dist_to_goal < analytic_dist and can_shoot:
             if mode == "SUMMON":
-                # Summon için sadece 1-2 açı test et (Hızlandırma)
                 test_yaws = [gyaw]
                 if curr_angle_err <= yaw_tol:
                     test_yaws.append(curr.yaw)
             else:
-                test_yaws = [
-                    gyaw,
-                    normalize_angle(gyaw + yaw_tol * 0.5),
-                    normalize_angle(gyaw - yaw_tol * 0.5),
-                    normalize_angle(gyaw + yaw_tol),
-                    normalize_angle(gyaw - yaw_tol)
-                ]
-                if curr_angle_err <= yaw_tol:
-                    test_yaws.append(curr.yaw)
+                # FORWARD PARK İÇİN SADECE VE SADECE DÜMDÜZ HEDEFE AT! Yanlamasına tolerans yok.
+                test_yaws = [gyaw]
             
             best_rs_cost = float('inf')
             best_rs_data = None
@@ -615,6 +621,10 @@ def hybrid_a_star(start, goal, obstacles, mode="FORWARD"):
                                     path_cost += COST_GEAR_SWITCH
                                     switches += 1
                             
+                            # KESİN KURAL: Forward park yapıyorsa son atışta ASLA vites değişemez ve geri (rd=-1) gidemez!
+                            if mode == "FORWARD" and (switches > 0 or rd[0] != 1):
+                                continue
+                                
                             if mode == "SUMMON" and switches > 0:
                                 continue 
                             
@@ -707,6 +717,14 @@ def run_simulation():
         
         sel = MapSelector(slots, ed.custom_obstacles); plt.show()
         if not sel.done or sel.target_id is None: return
+        # Start pose comes from AprilTag automatically (no manual placement).
+        current_start = get_start_pose_from_apriltag()
+        if current_start is None:
+            messagebox.showerror(
+                "AprilTag",
+                "Could not read latest map pose. Run apriltag_pose with a locked tag pose first.",
+            )
+            return
         plt.close('all')
 
         obs_list = [box(0,0,MAP_SIZE,0), box(0,MAP_SIZE,MAP_SIZE,MAP_SIZE), box(0,0,0,MAP_SIZE), box(MAP_SIZE,0,MAP_SIZE,MAP_SIZE)]
@@ -730,19 +748,6 @@ def run_simulation():
         primary_y = goal_in_y
         mode_str = "FORWARD"
 
-        current_start = get_start_pose_from_apriltag()
-        if current_start is None:
-            messagebox.showerror(
-                "AprilTag",
-                "Could not read latest map pose. Run apriltag_pose with a locked tag pose first.",
-            )
-            return
-
-        sx, sy, syaw = current_start
-        print(
-            f"[*] Start from AprilTag: x={sx:.2f} y={sy:.2f} cm, "
-            f"yaw_deg(tag)={(np.rad2deg(syaw - np.pi / 2) % 360):.1f} -> planner_yaw={np.rad2deg(syaw):.2f} deg"
-        )
         current_target = (primary_x, primary_y, primary_yaw)
         is_summon = False
 
