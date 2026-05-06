@@ -15,7 +15,7 @@ except Exception:
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
-from apriltag_pose import get_latest_map_pose
+from apriltag_pose_averaging import get_latest_map_pose
 
 
 MAP_SIZE = 200.0  # cm
@@ -339,4 +339,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
