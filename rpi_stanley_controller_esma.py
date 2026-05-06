@@ -41,6 +41,39 @@ def load_path(path_json_path: str):
     return data, pts
 
 
+def is_past_path_end(pose, points, past_long_cm: float = 3.0) -> bool:
+    """
+    True if the car has passed beyond the final path point along the commanded
+    travel direction. Adaptively uses rear-axle for reverse driving.
+    """
+    if len(points) < 1:
+        return False
+    
+    last = points[-1]
+    gx = float(last["x_cm"])
+    gy = float(last["y_cm"])
+    yaw = float(last["yaw_rad"])
+    direction = int(last.get("direction", 1))
+    
+    # KINEMATİK DÜZELTME: Geri geri gidiliyorsa referans noktasını arka aksa al.
+    if direction < 0:
+        cx = float(pose["x_cm"]) - STANLEY_WB_CM * math.cos(float(pose["yaw_rad"]))
+        cy = float(pose["y_cm"]) - STANLEY_WB_CM * math.sin(float(pose["yaw_rad"]))
+    else:
+        cx = float(pose["x_cm"])
+        cy = float(pose["y_cm"])
+
+    mx = math.cos(yaw)
+    my = math.sin(yaw)
+    
+    # Body-forward in map frame
+    tx = float(direction) * mx
+    ty = float(direction) * my
+    
+    longitudinal = (cx - gx) * tx + (cy - gy) * ty
+    return longitudinal > float(past_long_cm)
+
+
 def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     """
     Find nearest point index in a sliding window for speed.
@@ -62,9 +95,35 @@ def nearest_index(points, x_cm, y_cm, start_idx=0, window=400):
     return best_i
 
 
-def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=30.0, softening_rev=50.0):
+# Planner wheelbase (cm): rear axle to front axle. Used as rear-offset from localized “front” in reverse CTE / index tracking.
+STANLEY_WB_CM = 16
+
+
+def path_tracking_point_cm(pose: dict, points: list, idx_near: int) -> tuple[float, float]:
     """
-    Front-Axle Stanley with Planner Feedforward and True Kinematic Reverse.
+    Map position used to find nearest path index: same as localized pose in forward;
+    in reverse, rear axle (matches reverse CTE reference).
+    Uses direction on the path point at idx_near (clamped).
+    """
+    n = len(points)
+    if n == 0:
+        return float(pose["x_cm"]), float(pose["y_cm"])
+    i = clamp(int(idx_near), 0, n - 1)
+    seg_dir = int(points[i].get("direction", 1))
+    xf = float(pose["x_cm"])
+    yf = float(pose["y_cm"])
+    psi = float(pose["yaw_rad"])
+    if seg_dir < 0:
+        return (
+            xf - STANLEY_WB_CM * math.cos(psi),
+            yf - STANLEY_WB_CM * math.sin(psi),
+        )
+    return xf, yf
+
+
+def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=2.5, softening_fwd=30.0, softening_rev=35.0):
+    """
+    Front-axle Stanley with planner feedforward; reverse uses rear-axle position for CTE only.
     """
     n = len(points)
     idx = clamp(idx_near, 0, n - 1)
@@ -78,18 +137,23 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=
     # Perfect kinematic steering angle from the Hybrid A* planner
     steer_ff = float(p.get("steer_rad", 0.0))
 
-    x = float(pose["x_cm"])
-    y = float(pose["y_cm"])
+    x_front = float(pose["x_cm"])
+    y_front = float(pose["y_cm"])
     yaw = float(pose["yaw_rad"])
 
-    # 1. True Heading Error (Nose to Nose)
-    # We NO LONGER add pi. tyaw and yaw both represent the car's physical body orientation.
+    # 1. True Heading Error (unchanged: same body yaw as localization)
     heading_err = wrap_pi(tyaw - yaw)
 
-    # 2. Cross-Track Error
-    # Normal is based on the target body orientation
-    dx = x - tx
-    dy = y - ty
+    # 2. Cross-track reference: forward = localized point; reverse = rear axle from user formula
+    if direction < 0:
+        x_track = x_front - STANLEY_WB_CM * math.cos(yaw)
+        y_track = y_front - STANLEY_WB_CM * math.sin(yaw)
+    else:
+        x_track = x_front
+        y_track = y_front
+
+    dx = x_track - tx
+    dy = y_track - ty
     left_nx = -math.sin(tyaw)
     left_ny = math.cos(tyaw)
     cte = dx * left_nx + dy * left_ny  # +: vehicle is physically to the left of the target line
@@ -109,12 +173,12 @@ def stanley_control(points, pose, idx_near, k_fwd=1.2, k_rev=1.2, softening_fwd=
     # 4. Control Law
     v = 20.0  # Nominal speed
     cte_term = math.atan2(k * cte * cte_direction, (v + softening))
-    
-    if direction >= 0:
-        steer = - (- steer_ff + heading_err - cte_term)
+
+    if direction == -1:
+        steer = -steer_ff + heading_err - cte_term
     else:
-        steer = - steer_ff + heading_err - cte_term
-   
+        steer = -(-steer_ff + heading_err - cte_term)
+    
     steer = wrap_pi(steer)
     
     return steer, int(idx), direction
@@ -163,25 +227,33 @@ def main():
     POSE_TIMEOUT_S = 0.25
     CMD_TIMEOUT_S = 0.5
 
-    # steering mapping (servo)
-    SERVO_CENTER_DEG = 75.0
-    SERVO_MAX_DELTA_DEG = 25.0
-    MAX_STEER_RAD_FOR_SERVO = math.radians(35.0)  # planner max; maps to +-25deg at servo
+    # steering mapping (servo): straight ≈ 80°, mechanical limits 55°..105° (±25°)
+    SERVO_CENTER_DEG = 80.0
+    SERVO_MIN_DEG = 55.0
+    SERVO_MAX_DEG = 105.0
+    SERVO_MAX_DELTA_DEG = (SERVO_MAX_DEG - SERVO_MIN_DEG) / 2.0  # 25; scale full steer to limit range
+    MAX_STEER_RAD_FOR_SERVO = math.radians(25.0)  # planner max; maps to ±SERVO_MAX_DELTA_DEG at servo
     SERVO_MAX_SPEED_DEG_S = 60.0  # limit how fast servo command changes
 
     # throttle mapping
     THROTTLE_FWD = 160  # 0..255
     THROTTLE_REV = 140  # 0..255 (often safer a bit lower)
-    SLOWDOWN_DIST_CM = 45.0
-    GEAR_CHANGE_SERVO_SETTLE_S = 2.0  # pause motor on gear change; steer first
+    # End of route: stop if this far *past* the last point along travel direction (overshoot).
+    # Only applies when tracked index is in the last N path points (avoids false positives mid-route).
+    PAST_GOAL_LONG_CM = 3.0
+    PAST_GOAL_CHECK_LAST_POINTS = 10
+    # Stanley-style end: near last point in space and progressed along path
+    END_DIST_CM = 3.0
+    END_MIN_IDX_FROM_TAIL = 30
+    GEAR_CHANGE_SERVO_SETTLE_S = 3.0  # pause motor on gear change; steer first
     TURN_PWM_BOOST_MAX = 15  # extra PWM at full steering
     THROTTLE_MIN_MOVING = 110  # don't go below this unless stopping
 
     # Localization jump filter
-    LOCAL_JUMP_DIST_CM = 25.0
+    LOCAL_JUMP_DIST_CM = 5.0
     LOCAL_PENDING_MATCH_CYCLES = 5
-    LOCAL_PENDING_POS_TOL_CM = 6.0
-    LOCAL_PENDING_YAW_TOL_DEG = 12.0
+    LOCAL_PENDING_POS_TOL_CM = 4.0
+    LOCAL_PENDING_YAW_TOL_DEG = 8.0
 
     # --- Load path ---
     meta, points = load_path(PATH_FILE)
@@ -277,15 +349,27 @@ def main():
                 time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                 continue
 
-            # Progress along path by nearest point in a forward window
-            idx = nearest_index(points, last_pose["x_cm"], last_pose["y_cm"], start_idx=idx, window=50)
+            # Progress along path: in reverse, snap index using rear-axle position (same as reverse CTE).
+            tx, ty = path_tracking_point_cm(last_pose, points, idx)
+            idx = nearest_index(points, tx, ty, start_idx=idx, window=5)
 
-            steer_rad, idx, direction = stanley_control(points, last_pose, idx)
-
-            # Distance-to-goal (used for STOP condition / debug only)
+            # Distance-to-goal (used for STOP condition / debug / min throttle)
             gx = float(points[-1]["x_cm"])
             gy = float(points[-1]["y_cm"])
             dist_goal = math.hypot(last_pose["x_cm"] - gx, last_pose["y_cm"] - gy)
+
+            # Overshoot: longitudinal past final point (dot check). Only near end of path by index.
+            tail_gate = idx >= max(0, len(points) - PAST_GOAL_CHECK_LAST_POINTS)
+            if tail_gate and is_past_path_end(last_pose, points, PAST_GOAL_LONG_CM):
+                print(
+                    f"[STOP] Past path end (>{PAST_GOAL_LONG_CM:.1f} cm along travel); "
+                    f"dist_goal={dist_goal:.1f} cm idx={idx}"
+                )
+                ser.write(b"STOP\n")
+                last_cmd_t = time.perf_counter()
+                break
+
+            steer_rad, idx, direction = stanley_control(points, last_pose, idx)
             scale = 1.0  # do not slow down while parking (per user request)
 
             # Detect gear change (direction flip) and pause motor to let steering settle first.
@@ -306,7 +390,7 @@ def main():
             steer_rad = clamp(steer_rad, -MAX_STEER_RAD_FOR_SERVO, MAX_STEER_RAD_FOR_SERVO)
             # Steering sign/mapping intentionally left as-is (per user request).
             servo_deg = SERVO_CENTER_DEG + (steer_rad / MAX_STEER_RAD_FOR_SERVO) * SERVO_MAX_DELTA_DEG
-            servo_deg = clamp(servo_deg, SERVO_CENTER_DEG - SERVO_MAX_DELTA_DEG, SERVO_CENTER_DEG + SERVO_MAX_DELTA_DEG)
+            servo_deg = clamp(servo_deg, SERVO_MIN_DEG, SERVO_MAX_DEG)
             # Rate-limit servo so it doesn't snap to large angles instantly
             max_delta = SERVO_MAX_SPEED_DEG_S * dt
             servo_deg = rate_limit(servo_deg, last_servo_deg, max_delta=max_delta)
@@ -324,7 +408,7 @@ def main():
 
             # Enforce minimum moving throttle so we don't stop too early when slowing down.
             # If we are truly stopping (very close to goal), end condition below will handle STOP.
-            if throttle != 0 and dist_goal > 3.0:
+            if throttle != 0 and dist_goal > END_DIST_CM:
                 if 0 < throttle < THROTTLE_MIN_MOVING:
                     throttle = THROTTLE_MIN_MOVING
                 elif 0 > throttle > -THROTTLE_MIN_MOVING:
@@ -352,8 +436,9 @@ def main():
                 fig.canvas.draw_idle()
                 plt.pause(0.001)
 
-            # End condition
-            if dist_goal < 3.0 and idx > len(points) - 30:
+            # End condition: reached neighborhood of goal near end of path index
+            if dist_goal < END_DIST_CM and idx > len(points) - END_MIN_IDX_FROM_TAIL:
+                print(f"[STOP] Goal reached (dist={dist_goal:.1f} cm, idx={idx})")
                 ser.write(b"STOP\n")
                 break
 
@@ -383,4 +468,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
