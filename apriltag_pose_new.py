@@ -69,12 +69,6 @@ MAX_REPROJ_ERROR_PX = 4.0
 # flip" failure mode of planar-pose estimation.
 FUSION_YAW_OUTLIER_DEG = 30.0
 
-# Temporal smoothing inside the tracker. alpha is the weight on the
-# current sample (1.0 = no smoothing, 0.0 = freeze on the first frame).
-EMA_ALPHA = 0.4
-JUMP_RESET_CM = 12.0   # snap rather than smooth on jumps further than this
-JUMP_RESET_DEG = 25.0
-
 # Map coordinate system parameters
 MAP_SIZE = 200  # 200x200 cm map
 
@@ -1185,17 +1179,15 @@ class AprilTagMapPoseTracker:
     """Persistent AprilTag pose tracker (keeps cameras + detector open).
 
     Call ``update()`` in a loop to get the latest map pose. The tracker
-    fuses every visible tag from both cameras and applies an EMA on the
-    output for noise reduction. EMA state snaps (resets) on jumps larger
-    than ``JUMP_RESET_CM`` / ``JUMP_RESET_DEG`` so we don't fight the
-    consumer's own jump-rejection logic.
+    fuses every visible tag from both cameras and returns the fused pose
+    directly (no temporal smoothing is applied -- the caller is responsible
+    for any filtering they need).
 
     A small per-(camera, tag_id) pose cache is maintained to warm-start
     the LM refinement step in ``compute_camera_pose``.
     """
 
-    def __init__(self, tag_size_m=None, ema_alpha=EMA_ALPHA,
-                 jump_reset_cm=JUMP_RESET_CM, jump_reset_deg=JUMP_RESET_DEG):
+    def __init__(self, tag_size_m=None):
         global TAG_SIZE
         if tag_size_m is not None:
             TAG_SIZE = float(tag_size_m)
@@ -1214,14 +1206,6 @@ class AprilTagMapPoseTracker:
             ))
             cam.start()
 
-        self.ema_alpha = float(ema_alpha)
-        self.jump_reset_cm = float(jump_reset_cm)
-        self.jump_reset_deg = float(jump_reset_deg)
-
-        # Smoothed state; None means "filter not initialised yet".
-        self._smoothed_xy = None         # (x_cm, y_cm)
-        self._smoothed_yaw_unit = None   # (cos, sin) on the unit circle
-
         # Warm-start cache: {tag_id: (rvec_cam, tvec_cam)} per camera.
         self._prior_front = {}
         self._prior_back = {}
@@ -1239,58 +1223,15 @@ class AprilTagMapPoseTracker:
         for d in dets_back:
             self._prior_back[int(d["tag_id"])] = (d["rvec_cam"], d["tvec_cam"])
 
-    def _smooth(self, fused):
-        """Apply EMA + jump-reset to the fused pose. Mutates state in place."""
-        new_xy = (fused["x_cm"], fused["y_cm"])
-        yaw_rad = math.radians(fused["yaw_deg"])
-        new_unit = (math.cos(yaw_rad), math.sin(yaw_rad))
-
-        if self._smoothed_xy is None:
-            self._smoothed_xy = new_xy
-            self._smoothed_yaw_unit = new_unit
-            return fused
-
-        # Jump check (do not smooth across teleports).
-        dx = new_xy[0] - self._smoothed_xy[0]
-        dy = new_xy[1] - self._smoothed_xy[1]
-        pos_jump = math.hypot(dx, dy)
-        prev_yaw = math.atan2(self._smoothed_yaw_unit[1], self._smoothed_yaw_unit[0])
-        yaw_jump_deg = abs(math.degrees(_wrap_pi(yaw_rad - prev_yaw)))
-        if pos_jump > self.jump_reset_cm or yaw_jump_deg > self.jump_reset_deg:
-            self._smoothed_xy = new_xy
-            self._smoothed_yaw_unit = new_unit
-            return fused
-
-        a = self.ema_alpha
-        sx = a * new_xy[0] + (1.0 - a) * self._smoothed_xy[0]
-        sy = a * new_xy[1] + (1.0 - a) * self._smoothed_xy[1]
-        self._smoothed_xy = (sx, sy)
-
-        cu = a * new_unit[0] + (1.0 - a) * self._smoothed_yaw_unit[0]
-        su = a * new_unit[1] + (1.0 - a) * self._smoothed_yaw_unit[1]
-        norm = math.hypot(cu, su)
-        if norm > 1e-9:
-            cu /= norm
-            su /= norm
-        self._smoothed_yaw_unit = (cu, su)
-        smoothed_yaw = normalize_angle_deg_0_360(math.degrees(math.atan2(su, cu)))
-
-        out = dict(fused)
-        out["x_cm"] = float(sx)
-        out["y_cm"] = float(sy)
-        out["yaw_deg"] = float(smoothed_yaw)
-        return out
-
     def update(self):
-        """Capture both cameras, fuse all visible tags, smooth, and return.
+        """Capture both cameras, fuse all visible tags, and return.
 
-        Return shape (backward-compatible):
+        Return shape:
             {
               "x_cm": float, "y_cm": float, "yaw_deg": float,
               "tag_id": int (the highest-weight tag),
               "camera": "front" | "back" (highest-weight tag's camera),
               "distance_cm": float (highest-weight tag's distance),
-              # New optional fields:
               "n_tags": int (1 if single-tag, >1 if fused),
               "fused": bool,
               "reproj_error_px": float,
@@ -1312,10 +1253,7 @@ class AprilTagMapPoseTracker:
         # good prior for next frame's PnP refine.
         self._update_priors(dets_front, dets_back)
 
-        fused = _fuse_candidates(candidates)
-        if fused is None:
-            return None
-        return self._smooth(fused)
+        return _fuse_candidates(candidates)
 
 def main():
     """
